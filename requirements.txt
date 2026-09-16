@@ -1,0 +1,4 @@
+# Pinned to the versions the results in README.md were measured on.
+pyspark==4.0.4
+duckdb==1.5.5
+pyiceberg[sql-sqlite,pyarrow]==0.12.0

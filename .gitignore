@@ -1,0 +1,14 @@
+.venv/
+warehouse/
+truth.json
+
+# Article draft -- kept out of the public repo so the Medium post stays the
+# canonical version. Remove this line to publish it here too.
+ARTICLE.md
+__pycache__/
+*.pyc
+.ivy2/
+spark-warehouse/
+derby.log
+metastore_db/
+.DS_Store
