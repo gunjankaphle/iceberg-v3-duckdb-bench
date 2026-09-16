@@ -33,8 +33,22 @@ the variant type, and time travel across DV snapshots. On 5M rows with ~19%
 deleted, v3 deletion vectors read **~4.5× faster** than the equivalent v2
 positional deletes (4.3–4.7× across runs on one laptop).
 
-The gap is on the write side: `COPY TO ... (FORMAT ICEBERG, FORMAT_VERSION 3)`
-**silently produces a v2 table** — no error, no warning.
+On the **write** side DuckDB has two very different modes:
+
+- **With a catalog** (`ATTACH ... TYPE ICEBERG` against REST/Glue/S3 Tables):
+  `INSERT`/`UPDATE`/`DELETE` all work, and writing to a v3 table produces **real
+  Puffin deletion vectors** that Spark reads back correctly. Verified round-trip
+  against a local `apache/iceberg-rest-fixture`.
+- **Without a catalog** (`COPY TO` a local directory): create-only, v2 only, and
+  the option list is **not validated at all** — `BANANA true` is accepted just as
+  happily as `FORMAT_VERSION 3`. `APPEND true` does not append; it replaces the
+  table. There is no local/`hadoop` catalog for `ATTACH`.
+
+Practical rule: **if you want DuckDB to write Iceberg, give it a catalog.**
+
+The automated suite in this repo covers the read side and the `COPY TO` gap. The
+catalog write findings were verified manually (see the article); a scripted version
+would need a REST catalog container, which the suite deliberately doesn't require.
 
 ## Running it
 
