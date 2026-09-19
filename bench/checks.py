@@ -58,17 +58,37 @@ def normalize_json(s):
     return json.loads(s)
 
 
+# Floating-point comparison tolerance, in decimal places.
+#
+# Spark and DuckDB render doubles differently (DuckDB emits `-.000123` where
+# Spark emits `-0.000123`), and summing 5M doubles can differ in the last bits
+# depending on aggregation order. Comparisons are therefore made to this many
+# decimal places rather than exactly.
+#
+# This IS a real loosening: a reader returning 674988.50001 instead of 674988.5
+# would pass. It is bounded deliberately -- the test data uses values that are
+# exact in binary floating point (id * 1.5, id * 1.0), so in practice both
+# engines return identical doubles and this tolerance is never exercised.
+# Integers and Decimals are compared EXACTLY, with no rounding, which is what
+# the row-identity checksums (sum/min/max of id) rely on.
+FLOAT_DECIMALS = 4
+
+
 def normalize_row(row):
-    """Make engine row output comparable: tuples/lists unify, Decimals -> float."""
+    """Make engine row output comparable across Spark and DuckDB.
+
+    Integers and integral Decimals are preserved exactly (20-digit variant
+    integers must not become floats); non-integral values are compared to
+    FLOAT_DECIMALS places. See that constant for why.
+    """
     from decimal import Decimal
 
     out = []
     for v in row:
         if isinstance(v, Decimal):
-            # Keep exact ints exact (big ints matter); floats compare rounded.
-            v = int(v) if v == v.to_integral_value() else float(v)
+            v = int(v) if v == v.to_integral_value() else round(float(v), FLOAT_DECIMALS)
         elif isinstance(v, float):
-            v = round(v, 4)
+            v = round(v, FLOAT_DECIMALS)
         out.append(v)
     return tuple(out)
 

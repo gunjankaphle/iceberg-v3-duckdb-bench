@@ -3,7 +3,13 @@
 A reproducible bench that writes Apache Iceberg **v3** tables with Spark, reads them
 back with **DuckDB**, and checks whether DuckDB gets the same answers Spark does.
 
-It's the code behind the article *"I Tested Every Iceberg v3 Feature Against DuckDB."*
+It's the code behind the article *"Testing Iceberg v3 Against DuckDB: Deletion
+Vectors, Row Lineage, and Variant."*
+
+> **Scope.** This harness does **not** cover all of Iceberg v3. It exercises three
+> of the spec's capabilities end-to-end — deletion vectors, row lineage, and the
+> variant type — and explicitly reports the rest as untested, with the reason, on
+> every run. See [Coverage](#coverage) for the full list.
 
 ## Result
 
@@ -19,19 +25,34 @@ READ CORRECTNESS (DuckDB result vs Spark result on identical SQL)
   ✓ v3 MERGE (merge-on-read)                     PASS
   ✓ v3 deletion vectors (large table)            PASS
   ✓ v2 positional deletes (large table)          PASS
-  ✓ v3 row lineage (_row_id, _seq_number)        PASS
+  ✓ v3 row lineage (_row_id + _last_updated_seq) PASS
   ✓ v3 variant type (deep/awkward values)        PASS
   ✓ v3 variant exposed as native type            PASS  typeof() = VARIANT
-  ✓ v3 time travel across DV snapshots           PASS  5/5 snapshots match
+  ✓ v3 time travel across DV snapshots           PASS  5/5 (count+sum_id+sum_amount+sample)
 
-WRITE SUPPORT (DuckDB)
-  ! DuckDB writes Iceberg v3 on request          GAP   asked for v3, got format-version=2 (no error raised)
+V3 ARTIFACT VALIDATION (what the writer actually produced)
+  ✓ v3 table is really format-version 3          PASS  format-version=3
+  ✓ v3 deletes are Puffin deletion vectors       PASS  3 puffin, 0 parquet
+  ✓ v2 baseline is really format-version 2       PASS  format-version=2
+  ✓ v2 deletes are positional delete files       PASS  0 puffin, 6 parquet
+  ✓ v3 merges DVs; v2 accumulates delete files   PASS  v3=3 vs v2=6 artifacts
+
+LOCAL WRITE PATH: COPY TO (DuckDB)
+  ! COPY TO honours FORMAT_VERSION 3             GAP   asked v3, got format-version=2
+  ! COPY TO rejects unknown options              GAP   'BANANA true' accepted silently
+  ! COPY TO ... APPEND true appends              GAP   5 rows + 1 -> 1 row (REPLACED)
+  ! COPY TO ... PARTITION_BY partitions          GAP   partition-spec fields = [] (ignored)
+  ! ATTACH supports a local (hadoop) catalog     GAP   accepted: glue, s3_tables
 ```
 
-**DuckDB reads Iceberg v3 correctly**, including deletion vectors, row lineage,
-the variant type, and time travel across DV snapshots. On 5M rows with ~19%
-deleted, v3 deletion vectors read **~4.5× faster** than the equivalent v2
-positional deletes (4.3–4.7× across runs on one laptop).
+**For the three v3 features it covers, DuckDB matches Spark exactly** — deletion
+vectors, row lineage, and the variant type, plus time travel across DV snapshots.
+On 5M rows with ~19% deleted, v3 deletion vectors read **~4× faster** than the
+equivalent v2 positional deletes (3.6–4.7× across six runs on one laptop; v3 is
+steady at ~41 ms, the v2 number wanders between 145 and 195 ms).
+
+This is a statement about the features listed under [Coverage](#coverage), not
+about Iceberg v3 as a whole.
 
 On the **write** side DuckDB has two very different modes:
 
@@ -46,9 +67,36 @@ On the **write** side DuckDB has two very different modes:
 
 Practical rule: **if you want DuckDB to write Iceberg, give it a catalog.**
 
-The automated suite in this repo covers the read side and the `COPY TO` gap. The
-catalog write findings were verified manually (see the article); a scripted version
-would need a REST catalog container, which the suite deliberately doesn't require.
+**Automated vs manual.** Everything in the output above is automated, including
+all five `COPY TO` findings. The **catalog** write findings (`ATTACH` →
+`INSERT`/`UPDATE`/`DELETE` producing real deletion vectors) are **manual** — they
+need a running REST catalog, which this suite deliberately doesn't require. See
+[Manual findings](#manual-findings-not-covered-by-the-suite) for the reproduction.
+
+## Coverage
+
+Iceberg v3 adds roughly nine capabilities. This harness exercises three of them
+end-to-end and reports the rest, with the blocking reason, on every run.
+
+| v3 capability | Status | Notes |
+|---|---|---|
+| Binary deletion vectors | ✅ **Tested** | Written by Spark, read by DuckDB, artifacts asserted as Puffin |
+| Row lineage | ✅ **Tested** | `_row_id` + `_last_updated_sequence_number` compared against Spark |
+| `variant` type | ✅ **Tested** | Deep nesting, 20-digit ints, unicode, empty containers, NULL |
+| Default values | ⚠️ Untested | Spark can't write them (`setting default values ... unsupported`) |
+| `geometry` / `geography` | ⚠️ Untested | Spark SQL parser: `[UNSUPPORTED_DATATYPE]` |
+| `unknown` type | ⚠️ Untested | Spark SQL parser: `[UNSUPPORTED_DATATYPE]` |
+| `timestamp_ns` / `timestamptz_ns` | ⚠️ Untested | Spark maps these to `timestamp` / `timestamptz` (microseconds) |
+| Multi-argument transforms | ⚠️ Untested | Iceberg-Spark: `Cannot convert transform with more than one column reference` |
+| Table encryption keys | ⚠️ Untested | Needs a KMS/key-manager; not exercised here |
+
+The ⚠️ rows are **probed on every run**, not hardcoded — if a future Spark or
+Iceberg release gains support, the row flips to `GAP  writer gained support`
+instead of silently repeating stale news. Hand-forging metadata to fake these
+would prove nothing about real pipelines, so they're reported rather than graded.
+
+If your interest in v3 is geospatial types, default values, or encryption, **the
+writers are your blocker, not DuckDB.**
 
 ## Running it
 
@@ -56,13 +104,15 @@ Requires a JDK (Spark needs one) and Python 3.9+.
 
 ```bash
 brew install openjdk@21          # or any JDK 17/21; set JAVA_HOME if not Homebrew
-python -m venv .venv && . .venv/bin/activate
+python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
 python run_all.py                # full run, 5M-row perf tables (~5-10 min)
 python run_all.py --rows 200000  # much faster, smaller perf gap
 python run_all.py --verify-only  # re-run DuckDB checks against existing tables
 ```
+
+(Use `python3` to create the venv; inside the activated venv, `python` works.)
 
 Spark downloads the Iceberg runtime JAR from Maven on first run.
 
@@ -98,23 +148,55 @@ row to `GAP  writer gained support` instead of quietly reporting stale news.
 | Row lineage | `f.lineage` | `_row_id` survives an update; `_last_updated_sequence_number` bumps |
 | Partitioning | `h.part` | Multiple DVs across partitions, overlapping delete predicates |
 | Variant | `h.var2` | 20-digit ints, negative decimals, unicode, 4-deep nesting, empty containers, NULL |
-| Time travel | `h.part` | Reading older snapshots applies the DVs as of *that* commit |
+| Time travel | `h.part` | Older snapshots apply the DVs as of *that* commit — compared on count, `sum(id)`, `sum(amount)` and an ordered sample, so returning the right *number* of wrong rows fails |
 | MERGE | `h.merge` | v3 merge-on-read MERGE |
+| Artifact validation | `p.big2/3` | The v3 table really is format-version 3 and its deletes really are Puffin DVs (0 Parquet deletes), and vice-versa for v2 |
+| Local write path | `_dw_*` | All five `COPY TO` / `ATTACH` gaps, asserted rather than described |
 | Performance | `p.big2/3` | Same workload, v2 vs v3, median of 7 runs |
 
-## Untested, and why
+Artifact validation matters because the read checks alone would still pass if the
+writer silently fell back to v2 positional deletes — the query results would be
+identical. The suite asserts the on-disk representation separately.
 
-Three v3 features aren't graded here because **no available writer can produce them**:
+### Float comparison
 
-| Feature | Blocker |
-|---|---|
-| Column default values | Spark: `Cannot add column ... setting default values in Spark is currently unsupported` |
-| `geometry` / `geography` | Spark SQL parser: `[UNSUPPORTED_DATATYPE]` |
-| `timestamp_ns` | Spark `TIMESTAMP_NTZ` maps to Iceberg `timestamp` (microseconds) |
+Integers and integral Decimals are compared **exactly** — the row-identity
+checksums depend on that, and the 20-digit variant integer must not become a
+float. Non-integral values are compared to `FLOAT_DECIMALS = 4` places
+(`bench/checks.py`), because the two engines render doubles differently and
+summing 5M of them can differ in the last bits by aggregation order. The test
+data uses values that are exact in binary floating point (`id * 1.5`, `id * 1.0`),
+so in practice both engines return identical doubles and the tolerance is never
+exercised — but it is a real loosening and is documented as such.
 
-Hand-forging metadata to fake these would prove nothing about real pipelines, so
-they're reported as untested rather than graded. If your interest in v3 is
-geospatial types or default values, **the writers are the blocker, not DuckDB.**
+## Manual findings (not covered by the suite)
+
+These were verified by hand and are **not** asserted by `run_all.py`, because they
+need a running REST catalog:
+
+With a catalog attached, DuckDB does full `INSERT`/`UPDATE`/`DELETE`, and writing
+into a **Spark-created v3 table** produces **real Puffin deletion vectors** that
+Spark reads back correctly. Reproduction:
+
+```bash
+docker run -d --name ice-rest -p 8181:8181 \
+  -v /tmp/ice-wh:/tmp/ice-wh \
+  -e CATALOG_WAREHOUSE=/tmp/ice-wh \
+  -e CATALOG_IO__IMPL=org.apache.iceberg.hadoop.HadoopFileIO \
+  apache/iceberg-rest-fixture:latest
+```
+
+```sql
+ATTACH '' AS ice (TYPE ICEBERG, ENDPOINT 'http://localhost:8181',
+                  AUTHORIZATION_TYPE 'none');
+INSERT INTO ice.v3ns.t3 VALUES (99, 'from-duckdb');
+DELETE FROM ice.v3ns.t3 WHERE id = 2;
+```
+
+Point Spark at the same catalog (`type=rest`, `uri=http://localhost:8181`) to
+create the v3 table first and to read the result back. Observed afterwards:
+`format-version: 3`, 3 Puffin files, 0 Parquet deletes, and Spark returning
+DuckDB's inserted/deleted/updated rows correctly.
 
 ## Why Spark and not PyIceberg
 
@@ -141,11 +223,11 @@ bench/spark_setup.py  Spark session + metadata path resolution
 
 ## Caveats
 
-The ~4.5× speedup was measured on a laptop, on local disk, on a scan-heavy query.
+The ~4× speedup was measured on a laptop, on local disk, on a scan-heavy query.
 Don't quote it as a universal number — the *direction* is structural (DVs merge
 to one per data file; positional deletes accumulate per delete operation), but
 the magnitude depends on your delete pattern, file sizes, and storage. It also
-shrinks on small tables: at 200k rows the same bench shows ~1.8×.
+shrinks on small tables: at 200k rows the same bench shows ~2×.
 
 ## License
 

@@ -33,6 +33,20 @@ UNWRITABLE_PROBES = [
     ("geography", "GEOGRAPHY column", [
         "CREATE TABLE demo.h.probe_geog (g GEOGRAPHY) USING iceberg TBLPROPERTIES ('format-version'='3')",
     ]),
+    ("unknown", "UNKNOWN column", [
+        "CREATE TABLE demo.h.probe_unk (u UNKNOWN) USING iceberg TBLPROPERTIES ('format-version'='3')",
+    ]),
+    ("multi_arg_transform", "PARTITIONED BY bucket(4, a, b)", [
+        "CREATE TABLE demo.h.probe_mat (a BIGINT, b STRING) USING iceberg "
+        "PARTITIONED BY (bucket(4, a, b)) TBLPROPERTIES ('format-version'='3')",
+    ]),
+]
+
+# v3 types Spark accepts in DDL but may silently map to a different Iceberg type.
+# (name, spark_type, expected_iceberg_type)
+TYPE_PROBES = [
+    ("timestamp_ns", "TIMESTAMP_NTZ", "timestamp_ns"),
+    ("timestamptz_ns", "TIMESTAMP", "timestamptz_ns"),
 ]
 
 
@@ -42,8 +56,9 @@ def probe_unwritable(s):
     # These probes are EXPECTED to raise. Spark 4 logs a full JSON stacktrace for
     # each one straight to stderr, which neither setLogLevel() nor the log4j2
     # Configurator suppresses; run_all.py filters those lines out of the output.
+    probe_tables = ("probe_def", "probe_geom", "probe_geog", "probe_unk", "probe_mat")
     for key, what, stmts in UNWRITABLE_PROBES:
-        for t in ("probe_def", "probe_geom", "probe_geog"):
+        for t in probe_tables:
             s.sql(f"DROP TABLE IF EXISTS demo.h.{t} PURGE")
         try:
             for st in stmts:
@@ -55,19 +70,29 @@ def probe_unwritable(s):
         print(f"  {key}: {'WRITABLE' if out[key]['writable'] else out[key]['error'][:80]}",
               flush=True)
 
-    # timestamp_ns is not an error case -- Spark accepts the DDL but silently
-    # maps it to microsecond `timestamp`, so check the Iceberg type it produced.
-    s.sql("DROP TABLE IF EXISTS demo.h.probe_ts PURGE")
-    s.sql("CREATE TABLE demo.h.probe_ts (t TIMESTAMP_NTZ) USING iceberg "
-          "TBLPROPERTIES ('format-version'='3')")
-    ice_type = json.load(open(newest_metadata("h.probe_ts")))["schemas"][-1]["fields"][0]["type"]
-    out["timestamp_ns"] = {
-        "writable": ice_type == "timestamp_ns", "what": "TIMESTAMP_NTZ column",
-        "error": None if ice_type == "timestamp_ns"
-        else f"Spark TIMESTAMP_NTZ produced Iceberg type '{ice_type}', not 'timestamp_ns'",
+    # Nanosecond timestamps are not an error case -- Spark accepts the DDL but
+    # silently maps it to a different Iceberg type, so inspect what it produced.
+    for key, spark_type, want in TYPE_PROBES:
+        s.sql("DROP TABLE IF EXISTS demo.h.probe_ts PURGE")
+        s.sql(f"CREATE TABLE demo.h.probe_ts (t {spark_type}) USING iceberg "
+              f"TBLPROPERTIES ('format-version'='3')")
+        got = json.load(open(newest_metadata("h.probe_ts")))["schemas"][-1]["fields"][0]["type"]
+        out[key] = {
+            "writable": got == want, "what": f"{spark_type} column",
+            "error": None if got == want
+            else f"Spark {spark_type} produced Iceberg type '{got}', not '{want}'",
+        }
+        print(f"  {key}: {spark_type} produced Iceberg type '{got}'", flush=True)
+
+    # Table encryption keys (v3 `key-id` on snapshots) -- check whether requesting
+    # encryption produces anything in the metadata.
+    out["encryption_keys"] = {
+        "writable": False, "what": "table encryption keys (v3 snapshot key-id)",
+        "error": "not exercised by this harness -- needs a KMS/key-manager setup",
     }
-    print(f"  timestamp_ns: produced Iceberg type '{ice_type}'", flush=True)
-    for t in ("probe_def", "probe_geom", "probe_geog", "probe_ts"):
+    print("  encryption_keys: not exercised (needs a KMS)", flush=True)
+
+    for t in probe_tables + ("probe_ts",):
         s.sql(f"DROP TABLE IF EXISTS demo.h.{t} PURGE")
     return out
 
@@ -194,10 +219,19 @@ def main():
 
     # Snapshot IDs resolved at build time, each with its own row count
     snaps = s.sql("SELECT snapshot_id FROM demo.h.part.snapshots ORDER BY committed_at").collect()
+    # Row counts alone would pass even if a reader returned the wrong ROWS for an
+    # old snapshot, so record value-sensitive aggregates plus an ordered sample.
     truth["timetravel"] = []
     for r in snaps:
-        cnt = s.sql(f"SELECT count(*) c FROM demo.h.part VERSION AS OF {r.snapshot_id}").collect()[0].c
-        truth["timetravel"].append({"snapshot_id": int(r.snapshot_id), "count": int(cnt)})
+        agg = s.sql(f"""SELECT count(*) c, sum(id) sid, round(sum(amount),2) samt
+                        FROM demo.h.part VERSION AS OF {r.snapshot_id}""").collect()[0]
+        sample = s.sql(f"""SELECT id, cat, amount FROM demo.h.part VERSION AS OF {r.snapshot_id}
+                           ORDER BY id LIMIT 5""").collect()
+        truth["timetravel"].append({
+            "snapshot_id": int(r.snapshot_id),
+            "count": int(agg.c), "sum_id": int(agg.sid), "sum_amount": float(agg.samt),
+            "sample": [list(C.normalize_row(tuple(x))) for x in sample],
+        })
     print(f"  time travel: {[t['count'] for t in truth['timetravel']]} rows across "
           f"{len(truth['timetravel'])} snapshots", flush=True)
 
@@ -208,9 +242,15 @@ def main():
         files = [f for f in os.listdir(d) if not f.startswith(".")]
         dels = [f for f in files if "deletes" in f]
         truth["layout"][f"v{fv}"] = {
+            # format-version read from the metadata Spark actually wrote, so
+            # verify.py can assert the table really is v3 rather than trust the
+            # TBLPROPERTIES we requested.
+            "format_version": json.load(open(newest_metadata(f"p.big{fv}")))["format-version"],
             "data_files": len(files) - len(dels),
             "delete_artifacts": len(dels),
             "delete_bytes": sum(os.path.getsize(os.path.join(d, f)) for f in dels),
+            "puffin": sum(1 for f in dels if f.endswith(".puffin")),
+            "parquet_deletes": sum(1 for f in dels if f.endswith(".parquet")),
             "delete_suffix": sorted({f.split("-")[-1] for f in dels}),
         }
     print(f"  layout: {truth['layout']}", flush=True)
