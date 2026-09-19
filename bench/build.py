@@ -131,13 +131,7 @@ def read_puffin_footer(path):
     if data[-16 - size:-12 - size] != PUFFIN_MAGIC:
         raise ValueError(f"{path}: footer start magic mismatch")
     if flags[0] & 1:
-        # Iceberg 1.11 writes uncompressed footers, so this path is untested
-        # here; lz4 is not in requirements.txt for that reason.
-        try:
-            import lz4.frame
-        except ImportError:
-            raise ValueError(
-                f"{path}: footer is LZ4-compressed; `pip install lz4` to read it")
+        import lz4.frame
         payload = lz4.frame.decompress(payload)
     return json.loads(payload.decode("utf-8"))
 
@@ -152,6 +146,8 @@ def main():
     ap.add_argument("--rows", type=int, default=5_000_000,
                     help="row count for the 5M-row performance tables")
     args = ap.parse_args()
+    if args.rows < 1:
+        ap.error("--rows must be a positive integer")
 
     s = get_spark()
     s.sparkContext.setLogLevel("ERROR")
@@ -195,7 +191,10 @@ def main():
     build("h.part",
           f"""CREATE TABLE demo.h.part (id BIGINT, cat STRING, amount DOUBLE)
               USING iceberg PARTITIONED BY (cat) TBLPROPERTIES ({V3},{MOR})""",
-          ["INSERT INTO demo.h.part SELECT id, concat('c',id%4), id*1.0 FROM range(1,2001)",
+          # amount is deliberately NOT proportional to id -- if it were, sum(amount)
+          # would just be a scaled sum(id) and the time-travel check would have one
+          # signal wearing two hats.
+          ["INSERT INTO demo.h.part SELECT id, concat('c',id%4), ((id*37)%101)*1.25 FROM range(1,2001)",
            "DELETE FROM demo.h.part WHERE id % 7 = 0",
            "DELETE FROM demo.h.part WHERE id % 11 = 0",
            "DELETE FROM demo.h.part WHERE cat='c3' AND id < 500",
@@ -268,8 +267,12 @@ def main():
     for r in snaps:
         agg = s.sql(f"""SELECT count(*) c, sum(id) sid, round(sum(amount),2) samt
                         FROM demo.h.part VERSION AS OF {r.snapshot_id}""").collect()[0]
-        sample = s.sql(f"""SELECT id, cat, amount FROM demo.h.part VERSION AS OF {r.snapshot_id}
-                           ORDER BY id LIMIT 5""").collect()
+        # Sample both ends: a head-only sample covers ids 1-6 out of ~2000 rows
+        # and would miss a reader that mishandles later positions in a DV.
+        sample = (s.sql(f"""SELECT id, cat, amount FROM demo.h.part VERSION AS OF {r.snapshot_id}
+                            ORDER BY id LIMIT 5""").collect()
+                  + s.sql(f"""SELECT id, cat, amount FROM demo.h.part VERSION AS OF {r.snapshot_id}
+                              ORDER BY id DESC LIMIT 5""").collect())
         truth["timetravel"].append({
             "snapshot_id": int(r.snapshot_id),
             "count": int(agg.c), "sum_id": int(agg.sid), "sum_amount": float(agg.samt),
@@ -284,27 +287,72 @@ def main():
         d = os.path.join(WAREHOUSE, "p", f"big{fv}", "data")
         files = [f for f in os.listdir(d) if not f.startswith(".")]
         dels = [f for f in files if "deletes" in f]
-        # Read the blob types out of each Puffin file rather than inferring a
-        # deletion vector from the ".puffin" extension.
-        blob_types, bad_puffin = [], []
-        for f in dels:
-            if not f.endswith(".puffin"):
-                continue
-            try:
-                blob_types.extend(puffin_blob_types(os.path.join(d, f)))
-            except Exception as e:
-                bad_puffin.append(f"{f}: {type(e).__name__}: {e}")
-
         # Cross-check against the manifest: Iceberg records DVs as delete files
         # with file_format=PUFFIN and a referenced_data_file.
         try:
-            df = s.sql(f"""SELECT file_format, content, referenced_data_file
+            df = s.sql(f"""SELECT file_path, file_format, content, referenced_data_file,
+                                  record_count, content_offset, content_size_in_bytes
                            FROM demo.p.big{fv}.delete_files""").collect()
-            manifest = [{"file_format": r.file_format, "content": int(r.content),
-                         "has_referenced_data_file": r.referenced_data_file is not None}
+            manifest = [{"file_path": r.file_path, "file_format": r.file_format,
+                         "content": int(r.content),
+                         "has_referenced_data_file": r.referenced_data_file is not None,
+                         "record_count": int(r.record_count),
+                         "content_offset": (None if r.content_offset is None
+                                            else int(r.content_offset)),
+                         "content_size_in_bytes": (None if r.content_size_in_bytes is None
+                                                   else int(r.content_size_in_bytes))}
                         for r in df]
         except Exception as e:
             manifest = {"error": f"{type(e).__name__}: {str(e).splitlines()[0][:80]}"}
+
+        # Discover currently live Puffin DVs through Iceberg metadata, not the
+        # writer's arbitrary filename convention.
+        #
+        # One Puffin file can hold blobs for several DVs, and several manifest
+        # entries can point into the SAME file. Reading every blob once per
+        # entry therefore double-counts (2 live DVs in 1 file with 2 blobs was
+        # reported as 4). Instead, resolve each entry to its specific blob via
+        # content_offset -- which also proves the blob the manifest points at is
+        # really a deletion vector, rather than merely that the file contains one.
+        blob_types, bad_puffin, footers = [], [], {}
+        if isinstance(manifest, list):
+            for entry in manifest:
+                if entry["file_format"] != "PUFFIN":
+                    continue
+                path, off = entry["file_path"], entry["content_offset"]
+                name = os.path.basename(path)
+                try:
+                    if path not in footers:
+                        footers[path] = read_puffin_footer(path)
+                    blobs = footers[path].get("blobs", [])
+                    if off is None:
+                        bad_puffin.append(f"{name}: manifest entry has no content_offset")
+                        continue
+                    match = [b for b in blobs if b.get("offset") == off]
+                    if not match:
+                        bad_puffin.append(
+                            f"{name}: no blob at manifest content_offset {off} "
+                            f"(offsets present: {[b.get('offset') for b in blobs]})")
+                        continue
+                    blob_types.append(match[0].get("type"))
+                except Exception as e:
+                    bad_puffin.append(f"{name}: {type(e).__name__}: {e}")
+
+        # Per-snapshot delete bookkeeping. Counting files on disk conflates three
+        # different things: artifacts live in the current snapshot, orphans left
+        # by superseded snapshots (nothing here runs expire_snapshots), and how
+        # many files a writer packs one commit's deletes into. Only the first is
+        # what a reader actually opens, so record it explicitly.
+        try:
+            snaps = s.sql(f"""SELECT operation, summary FROM demo.p.big{fv}.snapshots
+                              ORDER BY committed_at""").collect()
+            history = [{"operation": r.operation,
+                        "added_delete_files": int(r.summary.get("added-delete-files", 0)),
+                        "removed_delete_files": int(r.summary.get("removed-delete-files", 0)),
+                        "total_delete_files": int(r.summary.get("total-delete-files", 0))}
+                       for r in snaps]
+        except Exception as e:
+            history = {"error": f"{type(e).__name__}: {str(e).splitlines()[0][:80]}"}
 
         truth["layout"][f"v{fv}"] = {
             # format-version read from the metadata Spark actually wrote, so
@@ -322,7 +370,16 @@ def main():
             "dv_blob_count": sum(1 for t in blob_types if t == "deletion-vector-v1"),
             "non_dv_blob_count": sum(1 for t in blob_types if t != "deletion-vector-v1"),
             "unreadable_puffin": bad_puffin,
+            "live_puffin_files": len(footers),
             "manifest_delete_files": manifest,
+            # Live delete artifacts in the CURRENT snapshot -- what a reader opens.
+            "live_delete_files": len(manifest) if isinstance(manifest, list) else None,
+            "snapshot_history": history,
+            # Files written per delete commit: v2 writes one Parquet per data
+            # file, v3 packs a commit's DV blobs into a single Puffin file.
+            "delete_files_per_commit": ([h["added_delete_files"] for h in history
+                                         if h["added_delete_files"]]
+                                        if isinstance(history, list) else None),
         }
     print(f"  layout: {truth['layout']}", flush=True)
 

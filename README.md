@@ -13,7 +13,8 @@ Vectors, Row Lineage, and Variant."*
 
 ## Result
 
-With **DuckDB 1.5.5**, **Iceberg 1.11.0**, **Spark 4.0.4**:
+With **DuckDB 1.5.5**, **Iceberg 1.11.0**, **Spark 4.0.4** (abridged — the
+UNTESTED and READ PERFORMANCE sections are omitted here):
 
 ```
 READ CORRECTNESS (DuckDB result vs Spark result on identical SQL)
@@ -32,25 +33,33 @@ READ CORRECTNESS (DuckDB result vs Spark result on identical SQL)
 
 V3 ARTIFACT VALIDATION (what the writer actually produced)
   ✓ v3 table is really format-version 3          PASS  format-version=3
-  ✓ v3 deletes are deletion-vector-v1 blobs      PASS  6 DV blobs in 3 Puffin file(s), 0 parquet
+  ✓ v3 deletes are deletion-vector-v1 blobs      PASS  2 live DV blob(s) in 1 Puffin file
   ✓ v3 manifest records DVs as Puffin            PASS  formats=['PUFFIN'], all reference a data file
   ✓ v2 baseline is really format-version 2       PASS  format-version=2
   ✓ v2 deletes are positional delete files       PASS  6 parquet, 0 DV blobs, manifest=['PARQUET']
-  ✓ v3 merges DVs; v2 accumulates delete files   PASS  v3=3 vs v2=6 artifacts
+  ✓ neither format accumulates delete files      PASS  live delete artifacts: v3=2 v2=2
+  ✓ v3 packs a commit's deletes into fewer files PASS  physical files per commit: v3=1.0 v2=2.0
 
 LOCAL WRITE PATH: COPY TO (DuckDB)
   ! COPY TO honours FORMAT_VERSION 3             GAP   asked v3, got format-version=2
-  ! COPY TO rejects unknown options              GAP   'BANANA true' accepted silently
+  ! COPY TO rejects unknown options              GAP   6/6 bogus options accepted silently
   ! COPY TO ... APPEND true appends              GAP   5 rows + 1 -> 1 row (REPLACED)
   ! COPY TO ... PARTITION_BY partitions          GAP   partition-spec fields = [] (ignored)
   ! ATTACH supports a local (hadoop) catalog     GAP   accepted: glue, s3_tables
+
+PYICEBERG 0.12 (third engine, cross-check)
+  ✓ PyIceberg 0.12.0 reads a v3 table            PASS  format-version=3, 900 rows
+  ! PyIceberg writes a v3 table                  GAP   Writing V3 is not yet supported
 ```
 
 **For the three v3 features it covers, DuckDB matches Spark exactly** — deletion
 vectors, row lineage, and the variant type, plus time travel across DV snapshots.
-On 5M rows with ~19% deleted, v3 deletion vectors read **~4× faster** than the
-equivalent v2 positional deletes (3.6–4.7× across six runs on one laptop; v3 is
-steady at ~41 ms, the v2 number wanders between 145 and 195 ms).
+On 5M rows with ~19% deleted, v3 deletion vectors read **3.5–4.7× faster** than
+the equivalent v2 positional deletes on one laptop. Each run takes 7 timed rounds
+with **alternating measurement order** and writes every raw timing to
+`truth.json`; order shows no detectable effect. Within a run the ratio is stable
+to ~±0.1×; the spread across runs is the v2 number drifting (135–195 ms) while v3
+stays near 40 ms.
 
 This is a statement about the features listed under [Coverage](#coverage), not
 about Iceberg v3 as a whole.
@@ -70,10 +79,15 @@ On the **write** side DuckDB has two very different modes:
 Practical rule: **if you want DuckDB to write Iceberg, give it a catalog.**
 
 **Automated vs manual.** Everything in the output above is automated, including
-all five `COPY TO` findings. The **catalog** write findings (`ATTACH` →
-`INSERT`/`UPDATE`/`DELETE` producing real deletion vectors) are **manual** — they
-need a running REST catalog, which this suite deliberately doesn't require. See
-[Manual findings](#manual-findings-not-covered-by-the-suite) for the reproduction.
+all five local write-path findings (four `COPY TO`, one `ATTACH`) and the
+PyIceberg cross-check. Two things are **not** automated:
+
+1. The **catalog** write findings (`ATTACH` → `INSERT`/`UPDATE`/`DELETE` producing
+   real deletion vectors) — these need a running REST catalog, which this suite
+   deliberately doesn't require. See
+   [Manual findings](#manual-findings-not-covered-by-the-suite).
+2. The **across-run range** (3.5–4.7×) — each run reports its own ratio and raw
+   timings, but aggregating across runs was done by hand.
 
 ## Coverage
 
@@ -162,7 +176,8 @@ untried rather than probed.)
 | Time travel | `h.part` | Older snapshots apply the DVs as of *that* commit — compared on count, `sum(id)`, `sum(amount)` and an ordered sample, so returning the right *number* of wrong rows fails |
 | MERGE | `h.merge` | v3 merge-on-read MERGE |
 | Artifact validation | `p.big2/3` | The v3 table really is format-version 3, and its delete artifacts are verified as deletion vectors two independent ways: the **Puffin footer is parsed** and every blob must be `deletion-vector-v1`, and the **manifest** (`.delete_files`) must record them as `PUFFIN` with a `referenced_data_file`. Converse for the v2 baseline. A `.puffin` filename is never treated as proof |
-| Local write path | `_dw_*` | All five `COPY TO` / `ATTACH` gaps, asserted rather than described |
+| Local write path | `_dw_*` | All five local write gaps (four `COPY TO`, one `ATTACH`), asserted rather than described |
+| Third engine | `f.dv` | PyIceberg 0.12 reads the v3 table and matches Spark's row count; its v3 *writer* raises `NotImplementedError` |
 | Performance | `p.big2/3` | Same workload, v2 vs v3, median of 7 runs |
 
 Artifact validation matters because the read checks alone would still pass if the
@@ -296,15 +311,25 @@ bench/checks.py       shared check definitions (the SQL both engines run)
 bench/build.py        Spark: build tables, probe writer limits, emit truth.json
 bench/verify.py       DuckDB: run the same SQL, compare, print the report card
 bench/spark_setup.py  Spark session + metadata path resolution
+tools/check_docs.py   parses ```python / bash fences in the docs (run by run_all.py)
 ```
 
 ## Caveats
 
-The ~4× speedup was measured on a laptop, on local disk, on a scan-heavy query.
-Don't quote it as a universal number — the *direction* is structural (DVs merge
-to one per data file; positional deletes accumulate per delete operation), but
-the magnitude depends on your delete pattern, file sizes, and storage. It also
-shrinks on small tables: at 200k rows the same bench shows ~2×.
+The ~4× speedup was measured on a laptop, on local disk, on a scan-heavy query,
+with one delete pattern. Don't quote it as a universal number.
+
+Note what it is *not* caused by: in this workload **neither format accumulates**
+delete artifacts. Spark rewrites them on every delete round for v2 and v3 alike
+(`added 2, removed 2, total 2` each round), so both readers end up opening two
+delete artifacts covering identical deletes. The suite asserts this. The likely
+cause is the **encoding** — a roaring bitmap tested directly versus a Parquet
+position list that must be read and anti-joined — but that is a mechanism, not a
+measured result. The magnitude shrinks on small tables: at 200k rows the same
+bench shows ~2×.
+
+The reversed-measurement-order check is automated (7 rounds, alternating, raw
+timings in `truth.json`). Only the across-run range was aggregated by hand.
 
 ## License
 

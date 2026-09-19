@@ -15,12 +15,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.join(HERE, "bench")
 
 # Spark is chatty, and the writer-capability probes in build.py deliberately
-# trigger errors that Spark 4 logs as multi-KB JSON records on stderr. Drop the
-# log lines so the report card stays readable; real output is unaffected.
+# trigger errors that Spark 4 logs as multi-KB JSON records on stderr. Drop
+# those log lines so the report card stays readable.
+#
+# ERROR-level lines are deliberately NOT filtered: an earlier version matched
+# `(WARN|INFO|ERROR)\s` and swallowed genuine failures like
+# "ERROR SparkContext: Failed to initialize". The expected probe errors arrive
+# as {"ts":...} JSON records, which the first alternative already covers.
 NOISE = re.compile(
     r'^\s*(\{"ts":'                      # Spark 4 structured JSON log records
     r'|\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}'  # classic log4j lines
-    r'|(WARN|INFO|ERROR)\s'
+    r'|(WARN|INFO)\s'
     r'|:: |\[Stage |Ivy Default Cache|The jars for the packages'
     r'|.*\badded as a dependency\b'
     r'|\s*(confs:|found |downloading |\[SUCCESSFUL\]|:: resolution report))'
@@ -55,12 +60,22 @@ def main():
     ap.add_argument("--rows", type=int, default=5_000_000)
     ap.add_argument("--verify-only", action="store_true")
     a = ap.parse_args()
+    if a.rows < 1:
+        ap.error("--rows must be a positive integer")
 
     if not a.verify_only:
         if run("build.py", "--rows", str(a.rows)) != 0:
             print("build failed", file=sys.stderr)
             return 1
-    return run("verify.py")
+    rc = run("verify.py")
+
+    # A broken documented command is a release blocker, too.
+    docs = subprocess.run([sys.executable, os.path.join(HERE, "tools", "check_docs.py")],
+                          cwd=HERE, capture_output=True, text=True)
+    if docs.returncode != 0:
+        print("\nDOC CHECK\n" + docs.stdout.strip(), flush=True)
+        return docs.returncode
+    return rc
 
 
 if __name__ == "__main__":

@@ -54,8 +54,46 @@ def normalize_json(s):
     s = s.strip()
     if s == "" or s == "null":
         return None
-    s = re.sub(r"(?<=[:\[,])(\s*)(-?)\.", r"\1\g<2>0.", s)
-    return json.loads(s)
+    return json.loads(_restore_leading_zeros(s))
+
+
+def _restore_leading_zeros(s):
+    """Turn DuckDB's bare `-.5` fractions into valid JSON `-0.5`.
+
+    Must skip string literals: a naive regex rewrites the CONTENTS of strings
+    too, so `{"s":"a:.b"}` would silently become `{"s":"a:0.b"}` and mask a real
+    difference between the engines. This walks the text and only rewrites while
+    outside a string.
+    """
+    out, i, n, in_str, esc = [], 0, len(s), False, False
+    while i < n:
+        c = s[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        # A '.' that starts a number: at the very beginning, or after a
+        # structural character / sign, with a digit following.
+        if c == "." and i + 1 < n and s[i + 1].isdigit():
+            prev = next((ch for ch in reversed(out) if not ch.isspace()), None)
+            if prev is None or prev in ":[,{" or (prev == "-" and len(out) >= 1):
+                out.append("0.")
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 # Floating-point comparison tolerance, in decimal places.

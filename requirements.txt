@@ -2,3 +2,5 @@
 pyspark==4.0.4
 duckdb==1.5.5
 pyiceberg[sql-sqlite,pyarrow]==0.12.0
+# Puffin footers may be LZ4-compressed; artifact validation parses them.
+lz4==4.4.5
