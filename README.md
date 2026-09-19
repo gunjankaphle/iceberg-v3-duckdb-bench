@@ -61,9 +61,10 @@ On the **write** side DuckDB has two very different modes:
   Puffin deletion vectors** that Spark reads back correctly. Verified round-trip
   against a local `apache/iceberg-rest-fixture`.
 - **Without a catalog** (`COPY TO` a local directory): create-only, v2 only, and
-  the option list is **not validated at all** — `BANANA true` is accepted just as
-  happily as `FORMAT_VERSION 3`. `APPEND true` does not append; it replaces the
-  table. There is no local/`hadoop` catalog for `ATTACH`.
+  **unknown option names are accepted without error** — a made-up `BANANA true`
+  is accepted just as happily as `FORMAT_VERSION 3`. Of the options tested,
+  none were honoured: `APPEND true` does not append, it *replaces* the table,
+  and `PARTITION_BY` is ignored. There is no local/`hadoop` catalog for `ATTACH`.
 
 Practical rule: **if you want DuckDB to write Iceberg, give it a catalog.**
 
@@ -90,13 +91,20 @@ end-to-end and reports the rest, with the blocking reason, on every run.
 | Multi-argument transforms | ⚠️ Untested | Iceberg-Spark: `Cannot convert transform with more than one column reference` |
 | Table encryption keys | ⚠️ Untested | Needs a KMS/key-manager; not exercised here |
 
-The ⚠️ rows are **probed on every run**, not hardcoded — if a future Spark or
-Iceberg release gains support, the row flips to `GAP  writer gained support`
-instead of silently repeating stale news. Hand-forging metadata to fake these
-would prove nothing about real pipelines, so they're reported rather than graded.
+**These blockers are specific to the writer this harness uses** — Spark 4.0.4 with
+`iceberg-spark-runtime-4.0_2.13:1.11.0`. They are not claims about Iceberg v3
+support in general: Trino, Flink, or a newer Iceberg release may write some of
+these fine. Encryption keys are the one row that was never attempted at all
+(it needs a KMS), as opposed to attempted and refused.
 
-If your interest in v3 is geospatial types, default values, or encryption, **the
-writers are your blocker, not DuckDB.**
+Everything else in the ⚠️ column is **probed on every run**, not hardcoded — if a
+future Spark or Iceberg release gains support, the row flips to
+`GAP  writer gained support` instead of silently repeating stale news.
+Hand-forging metadata to fake these would prove nothing about real pipelines, so
+they're reported rather than graded.
+
+If your interest in v3 is geospatial types or default values, **check your writer
+before blaming your reader.**
 
 ## Running it
 
@@ -176,27 +184,88 @@ need a running REST catalog:
 
 With a catalog attached, DuckDB does full `INSERT`/`UPDATE`/`DELETE`, and writing
 into a **Spark-created v3 table** produces **real Puffin deletion vectors** that
-Spark reads back correctly. Reproduction:
+Spark reads back correctly.
+
+**1. Start the catalog.** The bind-mount matters: without it the catalog writes
+metadata inside the container at a path DuckDB then can't resolve on the host.
 
 ```bash
+mkdir -p /tmp/ice-wh && chmod 777 /tmp/ice-wh
 docker run -d --name ice-rest -p 8181:8181 \
   -v /tmp/ice-wh:/tmp/ice-wh \
   -e CATALOG_WAREHOUSE=/tmp/ice-wh \
   -e CATALOG_IO__IMPL=org.apache.iceberg.hadoop.HadoopFileIO \
-  apache/iceberg-rest-fixture:latest
+  apache/iceberg-rest-fixture@sha256:db8de90b5b7693d4ac334c336f91d9bbe320d7b19f4f514d26de84cdfbcbfe8d
+# that digest is what was tested; apache/iceberg-rest-fixture:1.10.1 is the
+# newest version tag if you prefer one.
+```
+
+**2. Create the v3 table with Spark**, pointed at the same catalog:
+
+```python
+SparkSession.builder
+  .config("spark.jars.packages",
+          "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.11.0")
+  .config("spark.sql.extensions",
+          "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+  .config("spark.sql.catalog.rest", "org.apache.iceberg.spark.SparkCatalog")
+  .config("spark.sql.catalog.rest.type", "rest")
+  .config("spark.sql.catalog.rest.uri", "http://localhost:8181")
+  .config("spark.sql.catalog.rest.warehouse", "/tmp/ice-wh")
+  .master("local[2]").getOrCreate()
 ```
 
 ```sql
+CREATE NAMESPACE IF NOT EXISTS rest.v3ns;
+CREATE TABLE rest.v3ns.t3 (id BIGINT, name STRING) USING iceberg
+  TBLPROPERTIES ('format-version'='3',
+                 'write.delete.mode'='merge-on-read',
+                 'write.update.mode'='merge-on-read');
+INSERT INTO rest.v3ns.t3 SELECT id, concat('v',id) FROM range(1,11);
+DELETE FROM rest.v3ns.t3 WHERE id = 5;          -- 9 rows remain
+```
+
+**3. Write to it from DuckDB:**
+
+```sql
+INSTALL iceberg; LOAD iceberg;
 ATTACH '' AS ice (TYPE ICEBERG, ENDPOINT 'http://localhost:8181',
                   AUTHORIZATION_TYPE 'none');
 INSERT INTO ice.v3ns.t3 VALUES (99, 'from-duckdb');
 DELETE FROM ice.v3ns.t3 WHERE id = 2;
+UPDATE ice.v3ns.t3 SET name = 'changed' WHERE id = 3;
 ```
 
-Point Spark at the same catalog (`type=rest`, `uri=http://localhost:8181`) to
-create the v3 table first and to read the result back. Observed afterwards:
-`format-version: 3`, 3 Puffin files, 0 Parquet deletes, and Spark returning
-DuckDB's inserted/deleted/updated rows correctly.
+**4. Check the artifacts.** The table stays at `format-version: 3` with **3 Puffin
+files and 0 Parquet delete files**, two of the Puffin files written by DuckDB —
+its files use bare UUIDv7 names (`966d0efc-…-deletes.puffin`) where Spark's are
+task-numbered (`00000-211-…-deletes.puffin`).
+
+**5. Read back from Spark — in a NEW process.** This step has a trap worth knowing
+about: Iceberg's Spark catalog caches table metadata, so the session from step 2
+will happily keep serving the pre-DuckDB state and make it look like nothing was
+written. Start a fresh Spark process (or set
+`spark.sql.catalog.rest.cache-enabled=false`), then:
+
+```sql
+SELECT id, name FROM rest.v3ns.t3 ORDER BY id;
+```
+
+Expected — 9 rows, with DuckDB's insert, delete and update all round-tripped
+through deletion vectors:
+
+```
+(1,'v1') (3,'changed') (4,'v4') (6,'v6') (7,'v7') (8,'v8') (9,'v9') (10,'v10') (99,'from-duckdb')
+        ^ updated by DuckDB                                            ^ inserted by DuckDB
+id=2 absent (deleted by DuckDB)   id=5 absent (deleted by Spark in step 2)
+```
+
+```bash
+docker rm -f ice-rest && rm -rf /tmp/ice-wh   # cleanup
+```
+
+These steps were run end-to-end against the pinned digest above; the output shown
+is from that run.
 
 ## Why Spark and not PyIceberg
 
