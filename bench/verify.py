@@ -112,14 +112,40 @@ def main():
     v3, v2 = truth["layout"]["v3"], truth["layout"]["v2"]
     record("v3 table is really format-version 3", PASS if v3["format_version"] == 3 else FAIL,
            f"format-version={v3['format_version']}")
-    record("v3 deletes are Puffin deletion vectors",
-           PASS if v3["puffin"] > 0 and v3["parquet_deletes"] == 0 else FAIL,
-           f"{v3['puffin']} puffin, {v3['parquet_deletes']} parquet ({v3['delete_suffix']})")
+    # Filenames prove nothing, so this checks the Puffin footer's declared blob
+    # types and the manifest's record of each delete file.
+    dv_ok = (v3["dv_blob_count"] > 0
+             and v3["non_dv_blob_count"] == 0
+             and not v3["unreadable_puffin"]
+             and v3["parquet_deletes"] == 0)
+    detail = (f"{v3['dv_blob_count']} deletion-vector-v1 blobs in {v3['puffin']} Puffin "
+              f"file(s), {v3['parquet_deletes']} parquet deletes")
+    if v3["unreadable_puffin"]:
+        detail += f" | UNREADABLE: {v3['unreadable_puffin'][0][:60]}"
+    elif v3["non_dv_blob_count"]:
+        detail += f" | non-DV blobs present: {v3['puffin_blob_types']}"
+    record("v3 deletes are deletion-vector-v1 blobs", PASS if dv_ok else FAIL, detail)
+
+    mf = v3.get("manifest_delete_files")
+    if isinstance(mf, dict):
+        record("v3 manifest records DVs as Puffin", FAIL, f"could not read: {mf.get('error')}")
+    else:
+        mf_ok = bool(mf) and all(e["file_format"] == "PUFFIN"
+                                 and e["has_referenced_data_file"] for e in mf)
+        record("v3 manifest records DVs as Puffin", PASS if mf_ok else FAIL,
+               f"{len(mf)} delete file(s), formats="
+               f"{sorted({e['file_format'] for e in mf})}, all reference a data file="
+               f"{all(e['has_referenced_data_file'] for e in mf) if mf else False}")
     record("v2 baseline is really format-version 2", PASS if v2["format_version"] == 2 else FAIL,
            f"format-version={v2['format_version']}")
+    v2mf = v2.get("manifest_delete_files")
+    v2_formats = (sorted({e["file_format"] for e in v2mf})
+                  if isinstance(v2mf, list) and v2mf else [])
     record("v2 deletes are positional delete files",
-           PASS if v2["parquet_deletes"] > 0 and v2["puffin"] == 0 else FAIL,
-           f"{v2['puffin']} puffin, {v2['parquet_deletes']} parquet ({v2['delete_suffix']})")
+           PASS if (v2["parquet_deletes"] > 0 and v2["puffin"] == 0
+                    and v2["dv_blob_count"] == 0 and v2_formats == ["PARQUET"]) else FAIL,
+           f"{v2['parquet_deletes']} parquet, {v2['puffin']} puffin, "
+           f"0 DV blobs, manifest formats={v2_formats}")
     record("v3 merges DVs; v2 accumulates delete files",
            PASS if v3["delete_artifacts"] < v2["delete_artifacts"] else FAIL,
            f"v3={v3['delete_artifacts']} vs v2={v2['delete_artifacts']} artifacts "

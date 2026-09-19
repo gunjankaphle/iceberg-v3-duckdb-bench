@@ -104,6 +104,49 @@ def newest_metadata(table):
     return max(files, key=lambda p: int(re.match(r"v(\d+)", os.path.basename(p)).group(1)))
 
 
+PUFFIN_MAGIC = b"\x50\x46\x41\x31"
+
+
+def read_puffin_footer(path):
+    """Parse a Puffin file's footer and return its FileMetadata.
+
+    A `.puffin` extension proves nothing about a file's contents, so the DV
+    assertion reads the actual blob types instead of trusting the filename.
+    Footer layout per the Puffin spec is:
+
+        Magic FooterPayload FooterPayloadSize Flags Magic
+
+    with 4-byte little-endian signed ints and bit 0 of Flags[0] marking an
+    LZ4-compressed payload.
+    """
+    import struct
+
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data[:4] != PUFFIN_MAGIC or data[-4:] != PUFFIN_MAGIC:
+        raise ValueError(f"{path}: not a Puffin file (magic mismatch)")
+    flags = data[-8:-4]
+    size = struct.unpack("<i", data[-12:-8])[0]
+    payload = data[-12 - size:-12]
+    if data[-16 - size:-12 - size] != PUFFIN_MAGIC:
+        raise ValueError(f"{path}: footer start magic mismatch")
+    if flags[0] & 1:
+        # Iceberg 1.11 writes uncompressed footers, so this path is untested
+        # here; lz4 is not in requirements.txt for that reason.
+        try:
+            import lz4.frame
+        except ImportError:
+            raise ValueError(
+                f"{path}: footer is LZ4-compressed; `pip install lz4` to read it")
+        payload = lz4.frame.decompress(payload)
+    return json.loads(payload.decode("utf-8"))
+
+
+def puffin_blob_types(path):
+    """Blob type strings declared in a Puffin file, e.g. ['deletion-vector-v1']."""
+    return [b.get("type") for b in read_puffin_footer(path).get("blobs", [])]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=5_000_000,
@@ -241,6 +284,28 @@ def main():
         d = os.path.join(WAREHOUSE, "p", f"big{fv}", "data")
         files = [f for f in os.listdir(d) if not f.startswith(".")]
         dels = [f for f in files if "deletes" in f]
+        # Read the blob types out of each Puffin file rather than inferring a
+        # deletion vector from the ".puffin" extension.
+        blob_types, bad_puffin = [], []
+        for f in dels:
+            if not f.endswith(".puffin"):
+                continue
+            try:
+                blob_types.extend(puffin_blob_types(os.path.join(d, f)))
+            except Exception as e:
+                bad_puffin.append(f"{f}: {type(e).__name__}: {e}")
+
+        # Cross-check against the manifest: Iceberg records DVs as delete files
+        # with file_format=PUFFIN and a referenced_data_file.
+        try:
+            df = s.sql(f"""SELECT file_format, content, referenced_data_file
+                           FROM demo.p.big{fv}.delete_files""").collect()
+            manifest = [{"file_format": r.file_format, "content": int(r.content),
+                         "has_referenced_data_file": r.referenced_data_file is not None}
+                        for r in df]
+        except Exception as e:
+            manifest = {"error": f"{type(e).__name__}: {str(e).splitlines()[0][:80]}"}
+
         truth["layout"][f"v{fv}"] = {
             # format-version read from the metadata Spark actually wrote, so
             # verify.py can assert the table really is v3 rather than trust the
@@ -252,6 +317,12 @@ def main():
             "puffin": sum(1 for f in dels if f.endswith(".puffin")),
             "parquet_deletes": sum(1 for f in dels if f.endswith(".parquet")),
             "delete_suffix": sorted({f.split("-")[-1] for f in dels}),
+            # Evidence that the Puffin files really hold deletion vectors.
+            "puffin_blob_types": sorted(set(blob_types)),
+            "dv_blob_count": sum(1 for t in blob_types if t == "deletion-vector-v1"),
+            "non_dv_blob_count": sum(1 for t in blob_types if t != "deletion-vector-v1"),
+            "unreadable_puffin": bad_puffin,
+            "manifest_delete_files": manifest,
         }
     print(f"  layout: {truth['layout']}", flush=True)
 

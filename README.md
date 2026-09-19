@@ -32,9 +32,10 @@ READ CORRECTNESS (DuckDB result vs Spark result on identical SQL)
 
 V3 ARTIFACT VALIDATION (what the writer actually produced)
   ✓ v3 table is really format-version 3          PASS  format-version=3
-  ✓ v3 deletes are Puffin deletion vectors       PASS  3 puffin, 0 parquet
+  ✓ v3 deletes are deletion-vector-v1 blobs      PASS  6 DV blobs in 3 Puffin file(s), 0 parquet
+  ✓ v3 manifest records DVs as Puffin            PASS  formats=['PUFFIN'], all reference a data file
   ✓ v2 baseline is really format-version 2       PASS  format-version=2
-  ✓ v2 deletes are positional delete files       PASS  0 puffin, 6 parquet
+  ✓ v2 deletes are positional delete files       PASS  6 parquet, 0 DV blobs, manifest=['PARQUET']
   ✓ v3 merges DVs; v2 accumulates delete files   PASS  v3=3 vs v2=6 artifacts
 
 LOCAL WRITE PATH: COPY TO (DuckDB)
@@ -160,7 +161,7 @@ untried rather than probed.)
 | Variant | `h.var2` | 20-digit ints, negative decimals, unicode, 4-deep nesting, empty containers, NULL |
 | Time travel | `h.part` | Older snapshots apply the DVs as of *that* commit — compared on count, `sum(id)`, `sum(amount)` and an ordered sample, so returning the right *number* of wrong rows fails |
 | MERGE | `h.merge` | v3 merge-on-read MERGE |
-| Artifact validation | `p.big2/3` | The v3 table really is format-version 3 and its deletes really are Puffin DVs (0 Parquet deletes), and vice-versa for v2 |
+| Artifact validation | `p.big2/3` | The v3 table really is format-version 3, and its delete artifacts are verified as deletion vectors two independent ways: the **Puffin footer is parsed** and every blob must be `deletion-vector-v1`, and the **manifest** (`.delete_files`) must record them as `PUFFIN` with a `referenced_data_file`. Converse for the v2 baseline. A `.puffin` filename is never treated as proof |
 | Local write path | `_dw_*` | All five `COPY TO` / `ATTACH` gaps, asserted rather than described |
 | Performance | `p.big2/3` | Same workload, v2 vs v3, median of 7 runs |
 
