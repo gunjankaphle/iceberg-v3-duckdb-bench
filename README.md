@@ -89,7 +89,7 @@ end-to-end and reports the rest, with the blocking reason, on every run.
 | `unknown` type | ⚠️ Untested | Spark SQL parser: `[UNSUPPORTED_DATATYPE]` |
 | `timestamp_ns` / `timestamptz_ns` | ⚠️ Untested | Spark maps these to `timestamp` / `timestamptz` (microseconds) |
 | Multi-argument transforms | ⚠️ Untested | Iceberg-Spark: `Cannot convert transform with more than one column reference` |
-| Table encryption keys | ⚠️ Untested | Needs a KMS/key-manager; not exercised here |
+| Table encryption keys | ⚠️ **Not attempted** | Needs a KMS/key-manager; the harness never tries this one |
 
 **These blockers are specific to the writer this harness uses** — Spark 4.0.4 with
 `iceberg-spark-runtime-4.0_2.13:1.11.0`. They are not claims about Iceberg v3
@@ -142,9 +142,11 @@ gitignored and regenerated per run, and snapshot IDs for the time-travel test ar
 resolved at build time (they're generated fresh on every commit, so hardcoding
 them would break for everyone but the original author).
 
-Features no available writer can produce are **probed at build time**, not
+Features Spark cannot produce in this harness are **probed at build time**, not
 assumed. If a future Spark or Iceberg release gains support, the run flips that
 row to `GAP  writer gained support` instead of quietly reporting stale news.
+(Table encryption keys are the one exception: never attempted, so reported as
+untried rather than probed.)
 
 ## What's tested
 
@@ -203,16 +205,21 @@ docker run -d --name ice-rest -p 8181:8181 \
 **2. Create the v3 table with Spark**, pointed at the same catalog:
 
 ```python
-SparkSession.builder
-  .config("spark.jars.packages",
-          "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.11.0")
-  .config("spark.sql.extensions",
-          "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-  .config("spark.sql.catalog.rest", "org.apache.iceberg.spark.SparkCatalog")
-  .config("spark.sql.catalog.rest.type", "rest")
-  .config("spark.sql.catalog.rest.uri", "http://localhost:8181")
-  .config("spark.sql.catalog.rest.warehouse", "/tmp/ice-wh")
-  .master("local[2]").getOrCreate()
+from pyspark.sql import SparkSession
+
+spark = (
+    SparkSession.builder
+    .config("spark.jars.packages",
+            "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.11.0")
+    .config("spark.sql.extensions",
+            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config("spark.sql.catalog.rest", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.rest.type", "rest")
+    .config("spark.sql.catalog.rest.uri", "http://localhost:8181")
+    .config("spark.sql.catalog.rest.warehouse", "/tmp/ice-wh")
+    .master("local[2]")
+    .getOrCreate()
+)
 ```
 
 ```sql
