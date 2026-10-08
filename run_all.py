@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import deque
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.join(HERE, "bench")
@@ -18,10 +19,7 @@ BENCH = os.path.join(HERE, "bench")
 # trigger errors that Spark 4 logs as multi-KB JSON records on stderr. Drop
 # those log lines so the report card stays readable.
 #
-# ERROR-level lines are deliberately NOT filtered: an earlier version matched
-# `(WARN|INFO|ERROR)\s` and swallowed genuine failures like
-# "ERROR SparkContext: Failed to initialize". The expected probe errors arrive
-# as {"ts":...} JSON records, which the first alternative already covers.
+# Preserve the complete output in a log; show the tail if a subprocess fails.
 NOISE = re.compile(
     r'^\s*(\{"ts":'                      # Spark 4 structured JSON log records
     r'|\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}'  # classic log4j lines
@@ -40,42 +38,55 @@ def run(script, *args):
         text=True, errors="replace", bufsize=1,
     )
     blank = False
-    for line in p.stdout:
-        # Spark's progress bar uses \r; keep only what follows the last one.
-        visible = line.rstrip("\n").split("\r")[-1]
-        if NOISE.match(visible):
-            continue
-        if not visible.strip():
-            blank = True  # collapse runs of blank lines rather than dropping them
-            continue
-        if blank:
-            print(flush=True)
-            blank = False
-        print(visible, flush=True)
-    return p.wait()
+    log_dir = os.path.join(HERE, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, script + ".log")
+    tail = deque(maxlen=40)
+    with open(log_path, "w", encoding="utf-8") as log:
+        for line in p.stdout:
+            log.write(line)
+            log.flush()
+            tail.append(line)
+            visible = line.rstrip("\n").split("\r")[-1]
+            if NOISE.match(visible) and "ERROR" not in visible and '"level":"ERROR"' not in visible:
+                continue
+            if not visible.strip():
+                blank = True
+                continue
+            if blank:
+                print(flush=True)
+                blank = False
+            # Expected probe stack traces remain in the log, not the report.
+            if visible.startswith('{"ts":'):
+                continue
+            print(visible, flush=True)
+    rc = p.wait()
+    if rc:
+        print(f"\n{script} failed; last output (full log: {log_path}):", file=sys.stderr)
+        print("".join(tail), file=sys.stderr)
+    return rc
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=5_000_000)
     ap.add_argument("--verify-only", action="store_true")
+    ap.add_argument("--results", help="write sanitized results to this JSON path")
     a = ap.parse_args()
-    if a.rows < 1:
-        ap.error("--rows must be a positive integer")
+    if a.rows < 1000:
+        ap.error("--rows must be at least 1000 for the delete-artifact workload")
+
+    for command in ([sys.executable, os.path.join(HERE, "tools", "check_docs.py")],
+                    [sys.executable, "-m", "unittest", "discover", "-s", "tests"]):
+        check = subprocess.run(command, cwd=HERE)
+        if check.returncode:
+            return check.returncode
 
     if not a.verify_only:
         if run("build.py", "--rows", str(a.rows)) != 0:
             print("build failed", file=sys.stderr)
             return 1
-    rc = run("verify.py")
-
-    # A broken documented command is a release blocker, too.
-    docs = subprocess.run([sys.executable, os.path.join(HERE, "tools", "check_docs.py")],
-                          cwd=HERE, capture_output=True, text=True)
-    if docs.returncode != 0:
-        print("\nDOC CHECK\n" + docs.stdout.strip(), flush=True)
-        return docs.returncode
-    return rc
+    return run("verify.py", *(["--results", os.path.abspath(a.results)] if a.results else []))
 
 
 if __name__ == "__main__":

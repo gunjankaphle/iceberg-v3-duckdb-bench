@@ -42,7 +42,7 @@ UNWRITABLE_PROBES = [
     ]),
 ]
 
-# v3 types Spark accepts in DDL but may silently map to a different Iceberg type.
+# Inspect ordinary Spark timestamp mappings; these do not request nanoseconds.
 # (name, spark_type, expected_iceberg_type)
 TYPE_PROBES = [
     ("timestamp_ns", "TIMESTAMP_NTZ", "timestamp_ns"),
@@ -65,13 +65,22 @@ def probe_unwritable(s):
                 s.sql(st)
             out[key] = {"writable": True, "what": what, "error": None}
         except Exception as e:
+            expected = {
+                "default_values": "setting default values",
+                "geometry": "UNSUPPORTED_DATATYPE",
+                "geography": "UNSUPPORTED_DATATYPE",
+                "unknown": "UNSUPPORTED_DATATYPE",
+                "multi_arg_transform": "more than one column reference",
+            }[key]
+            if expected not in str(e):
+                raise  # Infrastructure failures are not writer limitations.
             out[key] = {"writable": False, "what": what,
                         "error": str(e).strip().splitlines()[0][:150]}
         print(f"  {key}: {'WRITABLE' if out[key]['writable'] else out[key]['error'][:80]}",
               flush=True)
 
-    # Nanosecond timestamps are not an error case -- Spark accepts the DDL but
-    # silently maps it to a different Iceberg type, so inspect what it produced.
+    # This SQL route produces microsecond timestamps. It is not a test of
+    # writing an explicitly nanosecond Iceberg schema through other APIs.
     for key, spark_type, want in TYPE_PROBES:
         s.sql("DROP TABLE IF EXISTS demo.h.probe_ts PURGE")
         s.sql(f"CREATE TABLE demo.h.probe_ts (t {spark_type}) USING iceberg "
@@ -80,12 +89,11 @@ def probe_unwritable(s):
         out[key] = {
             "writable": got == want, "what": f"{spark_type} column",
             "error": None if got == want
-            else f"Spark {spark_type} produced Iceberg type '{got}', not '{want}'",
+            else f"SQL route produced '{got}'; explicit nanosecond schema not tested",
         }
         print(f"  {key}: {spark_type} produced Iceberg type '{got}'", flush=True)
 
-    # Table encryption keys (v3 `key-id` on snapshots) -- check whether requesting
-    # encryption produces anything in the metadata.
+    # Encryption is deliberately not attempted.
     out["encryption_keys"] = {
         "writable": False, "what": "table encryption keys (v3 snapshot key-id)",
         "error": "not exercised by this harness -- needs a KMS/key-manager setup",
@@ -127,6 +135,8 @@ def read_puffin_footer(path):
         raise ValueError(f"{path}: not a Puffin file (magic mismatch)")
     flags = data[-8:-4]
     size = struct.unpack("<i", data[-12:-8])[0]
+    if size < 0 or size > len(data) - 20:
+        raise ValueError(f"{path}: invalid Puffin footer size {size}")
     payload = data[-12 - size:-12]
     if data[-16 - size:-12 - size] != PUFFIN_MAGIC:
         raise ValueError(f"{path}: footer start magic mismatch")
@@ -146,8 +156,8 @@ def main():
     ap.add_argument("--rows", type=int, default=5_000_000,
                     help="row count for the 5M-row performance tables")
     args = ap.parse_args()
-    if args.rows < 1:
-        ap.error("--rows must be a positive integer")
+    if args.rows < 1000:
+        ap.error("--rows must be at least 1000 for the delete-artifact workload")
 
     s = get_spark()
     s.sparkContext.setLogLevel("ERROR")
@@ -247,7 +257,7 @@ def main():
             "table": table, "label": label, "sql": sql,
             "rows": [list(C.normalize_row(tuple(r))) for r in rows],
         }
-        print(f"  {label}: {truth['checks'][key]['rows']}", flush=True)
+        print(f"  {label}: {len(rows)} result row(s)", flush=True)
 
     # Row lineage metadata columns
     lin = s.sql(C.LINEAGE_SQL.format(t="demo.f.lineage", cols=", ".join(C.LINEAGE_COLS))).collect()
@@ -256,7 +266,9 @@ def main():
 
     # Variant, serialized to JSON and normalized
     var = s.sql(C.VARIANT_SQL_SPARK.format(t=f"demo.{C.VARIANT_TABLE}")).collect()
-    truth["variant"] = [[r[0], C.normalize_json(r[1])] for r in var]
+    # Keep the original JSON text: a JSON float round-trip would lose precision.
+    truth["variant"] = [[r[0], r[1]] for r in var]
+    truth["schema_version"] = 2
     print(f"  variant: {truth['variant']}", flush=True)
 
     # Snapshot IDs resolved at build time, each with its own row count
@@ -277,6 +289,9 @@ def main():
             "snapshot_id": int(r.snapshot_id),
             "count": int(agg.c), "sum_id": int(agg.sid), "sum_amount": float(agg.samt),
             "sample": [list(C.normalize_row(tuple(x))) for x in sample],
+            "rows": [list(C.normalize_row(tuple(x))) for x in s.sql(
+                f"SELECT id, cat, amount FROM demo.h.part VERSION AS OF {r.snapshot_id} ORDER BY id"
+            ).collect()],
         })
     print(f"  time travel: {[t['count'] for t in truth['timetravel']]} rows across "
           f"{len(truth['timetravel'])} snapshots", flush=True)
@@ -339,8 +354,8 @@ def main():
                     bad_puffin.append(f"{name}: {type(e).__name__}: {e}")
 
         # Per-snapshot delete bookkeeping. Counting files on disk conflates three
-        # different things: artifacts live in the current snapshot, orphans left
-        # by superseded snapshots (nothing here runs expire_snapshots), and how
+        # different things: artifacts live in the current snapshot, files retained
+        # for earlier snapshots (nothing here runs expire_snapshots), and how
         # many files a writer packs one commit's deletes into. Only the first is
         # what a reader actually opens, so record it explicitly.
         try:
@@ -374,6 +389,8 @@ def main():
             "manifest_delete_files": manifest,
             # Live delete artifacts in the CURRENT snapshot -- what a reader opens.
             "live_delete_files": len(manifest) if isinstance(manifest, list) else None,
+            "live_physical_delete_files": len({e["file_path"] for e in manifest})
+            if isinstance(manifest, list) else None,
             "snapshot_history": history,
             # Files written per delete commit: v2 writes one Parquet per data
             # file, v3 packs a commit's DV blobs into a single Puffin file.
@@ -381,11 +398,14 @@ def main():
                                          if h["added_delete_files"]]
                                         if isinstance(history, list) else None),
         }
-    print(f"  layout: {truth['layout']}", flush=True)
+    for key, layout in truth["layout"].items():
+        print(f"  {key}: {layout['live_delete_files']} live delete entries, "
+              f"{layout['live_physical_delete_files']} physical delete file(s)", flush=True)
 
     with open(TRUTH_PATH, "w") as fh:
         json.dump(truth, fh, indent=2)
     print(f"\nwrote {TRUTH_PATH}")
+    s.stop()
 
 
 if __name__ == "__main__":

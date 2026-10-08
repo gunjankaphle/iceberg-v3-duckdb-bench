@@ -4,18 +4,21 @@ Expected values come from truth.json, which build.py produced by running the
 same SQL through Spark. Nothing in this file is a hardcoded constant from a
 previous run, including the snapshot IDs used for time travel.
 """
-import glob
+import argparse
 import json
 import os
 import platform
-import shutil
 import statistics
 import sys
 import time
+import tempfile
+import subprocess
+import hashlib
+from datetime import datetime, timezone
 
 import duckdb
 
-from spark_setup import metadata_json, TRUTH_PATH, WAREHOUSE
+from spark_setup import metadata_json, TRUTH_PATH, WAREHOUSE, ROOT
 import checks as C
 
 PASS, FAIL, SKIP, GAP = "PASS", "FAIL", "n/a ", "GAP "
@@ -34,6 +37,10 @@ def scan(table):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results", help="write a sanitized, shareable result JSON")
+    args = ap.parse_args()
+    results.clear()
     if not os.path.exists(TRUTH_PATH):
         print(f"missing {TRUTH_PATH} -- run: python bench/build.py", file=sys.stderr)
         return 2
@@ -44,15 +51,19 @@ def main():
     missing = [k for k in required if k not in truth]
     if not missing and "live_delete_files" not in truth["layout"].get("v3", {}):
         missing = ["layout.v3.live_delete_files"]
-    if missing:
-        print(f"{TRUTH_PATH} is stale or from a different build.py (missing: "
-              f"{', '.join(missing)}).\nRe-run: python bench/build.py", file=sys.stderr)
+    if missing or truth.get("schema_version") != 2:
+        reason = "missing: " + ", ".join(missing) if missing else "expected schema_version=2"
+        print(f"{TRUTH_PATH} is stale or from a different build.py ({reason}).\n"
+              "Re-run: python run_all.py", file=sys.stderr)
         return 2
 
     con = duckdb.connect()
     con.execute("INSTALL iceberg; LOAD iceberg;")
+    extension = con.execute("SELECT extension_version, installed_from FROM duckdb_extensions() "
+                            "WHERE extension_name='iceberg'").fetchone()
     print(f"\nDuckDB {duckdb.__version__}  vs  Spark {truth['versions']['spark']} "
-          f"+ Iceberg {truth['versions']['iceberg']}\n")
+          f"+ Iceberg {truth['versions']['iceberg']}\n"
+          f"Iceberg extension {extension[0]} from {extension[1]}\n")
 
     print("READ CORRECTNESS (DuckDB result vs Spark result on identical SQL)")
     for key, table, label, sql in C.CHECKS:
@@ -79,12 +90,13 @@ def main():
 
     # Variant, compared as parsed JSON so key order and number formatting differences
     # between the two engines do not create false failures.
-    exp = [[r[0], r[1]] for r in truth["variant"]]
+    exp = [[r[0], C.normalize_json(r[1])] for r in truth["variant"]]
     try:
         raw = con.execute(C.VARIANT_SQL_DUCKDB.format(t=scan(C.VARIANT_TABLE))).fetchall()
         got = [[r[0], C.normalize_json(r[1])] for r in raw]
-        record("v3 variant type (deep/awkward values)", PASS if got == exp else FAIL,
-               "" if got == exp else f"duckdb={got} spark={exp}")
+        equal = C.json_equal(got, exp)
+        record("v3 variant type (deep/awkward values)", PASS if equal else FAIL,
+               "" if equal else f"duckdb={got} spark={exp}")
     except Exception as e:
         record("v3 variant type (deep/awkward values)", FAIL,
                f"ERROR {str(e).splitlines()[0][:70]}")
@@ -115,17 +127,20 @@ def main():
                 + con.execute(f"SELECT id, cat, amount FROM {src} ORDER BY id DESC LIMIT 5").fetchall())
             exp_agg = C.normalize_row((entry["count"], entry["sum_id"], entry["sum_amount"]))
             exp_sample = [tuple(r) for r in entry["sample"]]
-            if agg == exp_agg and sample == exp_sample:
+            all_rows = C.normalize_rows(con.execute(
+                f"SELECT id, cat, amount FROM {src} ORDER BY id").fetchall())
+            exp_rows = [tuple(r) for r in entry["rows"]]
+            if agg == exp_agg and sample == exp_sample and all_rows == exp_rows:
                 ok += 1
             elif not detail:
                 detail = (f"snapshot {sid}: duckdb agg={agg} spark={exp_agg}"
-                          if agg != exp_agg else f"snapshot {sid}: sample rows differ")
+                          if agg != exp_agg else f"snapshot {sid}: rows differ")
         except Exception as e:
             if not detail:
                 detail = f"snapshot {sid}: {type(e).__name__}: {str(e).splitlines()[0][:60]}"
     n_tt = len(truth["timetravel"])
-    record("v3 time travel across DV snapshots", PASS if ok == n_tt else FAIL,
-           f"{ok}/{n_tt} snapshots match (count+sum_id+sum_amount+sample)" + (f" | {detail}" if detail else ""))
+    record("v3 time travel across DV snapshots", PASS if n_tt > 0 and ok == n_tt else FAIL,
+           f"{ok}/{n_tt} snapshots match (aggregates + every row)" + (f" | {detail}" if detail else ""))
 
     # ---- v3 artifact validation ----
     # The read checks above would still pass if the writer silently fell back to
@@ -141,7 +156,7 @@ def main():
              and not v3["unreadable_puffin"])
     detail = (f"{v3['dv_blob_count']} live deletion-vector-v1 blob(s) in "
               f"{v3.get('live_puffin_files', '?')} Puffin file(s) "
-              f"({v3['puffin']} on disk incl. orphans from superseded snapshots)")
+              f"({v3['puffin']} on disk incl. files retained for older snapshots)")
     if v3["unreadable_puffin"]:
         detail += f" | UNREADABLE: {v3['unreadable_puffin'][0][:60]}"
     elif v3["non_dv_blob_count"]:
@@ -176,10 +191,10 @@ def main():
     # accumulates delete files" from on-disk file counts. That was wrong. The
     # snapshot history shows BOTH formats rewrite their delete artifacts each
     # round (added N, removed N, total N), so neither accumulates in this
-    # workload. The on-disk difference is orphans plus per-commit packaging.
+    # workload. The on-disk difference includes retained historical files.
     record("neither format accumulates delete files",
-           PASS if (v3["live_delete_files"] == v2["live_delete_files"]
-                    and v3["live_delete_files"] is not None) else FAIL,
+           PASS if (C.stable_delete_history(v3) and C.stable_delete_history(v2)
+                    and v3["live_delete_files"] == v2["live_delete_files"]) else FAIL,
            f"live delete artifacts: v3={v3['live_delete_files']} v2={v2['live_delete_files']} "
            f"(equal -- both rewrite per round, neither accumulates)")
     # Iceberg's added-delete-files counts delete ENTRIES (one per DV), not
@@ -199,16 +214,13 @@ def main():
 
     # ---- write side: COPY TO against a local directory ----
     # Every claim the README makes about the local write path is exercised here.
-    # The catalog-based write path (ATTACH -> INSERT/UPDATE/DELETE, which does
-    # produce real deletion vectors) needs a running REST catalog and is NOT
-    # covered by this suite -- see README "Manual findings".
+    # Catalog writes need a running catalog and are outside this suite.
     print("\nLOCAL WRITE PATH: COPY TO (DuckDB)")
     import glob as _glob
+    scratch = tempfile.TemporaryDirectory(prefix="write-probes-", dir=WAREHOUSE)
 
     def fresh(name):
-        d = os.path.join(WAREHOUSE, f"_dw_{name}")
-        shutil.rmtree(d, ignore_errors=True)
-        return d
+        return os.path.join(scratch.name, name)
 
     def fmt_version(d):
         m = _glob.glob(os.path.join(d, "metadata", "*.metadata.json"))
@@ -226,10 +238,10 @@ def main():
     try:
         con.execute(f"COPY (SELECT 1 a) TO '{d}' (FORMAT ICEBERG, FORMAT_VERSION 3)")
         fv = fmt_version(d)
-        record("COPY TO honours FORMAT_VERSION 3", GAP if fv != 3 else PASS,
+        record("COPY TO honours FORMAT_VERSION 3", PASS if fv == 3 else GAP if fv == 2 else FAIL,
                f"asked for v3, got format-version={fv} (no error raised)")
     except Exception as e:
-        record("COPY TO honours FORMAT_VERSION 3", GAP, f"{type(e).__name__}: {e}")
+        record("COPY TO honours FORMAT_VERSION 3", FAIL, f"{type(e).__name__}: {e}")
 
     # 2. Unknown options are not rejected. Several are tried so the claim in the
     #    docs ("every option I tested was ignored") is backed by the suite.
@@ -241,8 +253,10 @@ def main():
         try:
             con.execute(f"COPY (SELECT 1 a) TO '{d}' (FORMAT ICEBERG, {opt})")
             accepted.append(opt.split()[0])
-        except Exception:
+        except (duckdb.BinderException, duckdb.ParserException, duckdb.NotImplementedException):
             pass
+        except Exception as e:
+            record(f"unknown option probe {i}", FAIL, f"{type(e).__name__}: {e}")
     record("COPY TO rejects unknown options", GAP if accepted else PASS,
            f"{len(accepted)}/{len(bogus)} bogus options accepted silently: {accepted}"
            if accepted else "all rejected")
@@ -254,11 +268,12 @@ def main():
         before = rows(d)
         con.execute(f"COPY (SELECT 99 AS id) TO '{d}' (FORMAT ICEBERG, APPEND true)")
         after = rows(d)
-        record("COPY TO ... APPEND true appends", PASS if after == before + 1 else GAP,
+        record("COPY TO ... APPEND true appends",
+               PASS if after == before + 1 else GAP if before == 5 and after == 1 else FAIL,
                f"{before} rows + 1 appended -> {after} rows"
-               + ("" if after == before + 1 else "  (table was REPLACED, prior rows lost)"))
+               + ("" if after == before + 1 else "  (table was REPLACED)"))
     except Exception as e:
-        record("COPY TO ... APPEND true appends", GAP, f"{type(e).__name__}: {e}")
+        record("COPY TO ... APPEND true appends", FAIL, f"{type(e).__name__}: {e}")
 
     # 4. PARTITION_BY is ignored
     d = fresh("part")
@@ -270,7 +285,7 @@ def main():
         record("COPY TO ... PARTITION_BY partitions", PASS if specs else GAP,
                f"partition-spec fields = {specs}" + ("" if specs else "  (ignored)"))
     except Exception as e:
-        record("COPY TO ... PARTITION_BY partitions", GAP, f"{type(e).__name__}: {e}")
+        record("COPY TO ... PARTITION_BY partitions", FAIL, f"{type(e).__name__}: {e}")
 
     # 5. No local/hadoop catalog for ATTACH
     try:
@@ -278,10 +293,10 @@ def main():
         record("ATTACH supports a local (hadoop) catalog", PASS)
         con.execute("DETACH _local")
     except Exception as e:
-        record("ATTACH supports a local (hadoop) catalog", GAP,
+        expected = "Unrecognized 'endpoint_type' (hadoop)" in str(e)
+        record("ATTACH supports a local (hadoop) catalog", GAP if expected else FAIL,
                str(e).splitlines()[0][:92])
-    for leftover in glob.glob(os.path.join(WAREHOUSE, "_dw_*")):
-        shutil.rmtree(leftover, ignore_errors=True)
+    scratch.cleanup()
 
     # ---- PyIceberg: reads v3, cannot write it ----
     # Automated so the claim in the docs isn't a hand-run anecdote.
@@ -301,25 +316,23 @@ def main():
                f"{type(e).__name__}: {str(e).splitlines()[0][:70]}")
 
     try:
-        import tempfile
         from pyiceberg.catalog.sql import SqlCatalog
         from pyiceberg.schema import Schema
         from pyiceberg.types import NestedField, LongType
-        tmp = tempfile.mkdtemp(prefix="pyice_")
-        cat = SqlCatalog("t", uri=f"sqlite:///{tmp}/c.db", warehouse=f"file://{tmp}")
-        cat.create_namespace_if_not_exists("ns")
-        cat.create_table("ns.t", schema=Schema(NestedField(1, "id", LongType(), required=False)),
-                         properties={"format-version": "3"})
+        with tempfile.TemporaryDirectory(prefix="pyice_") as tmp:
+            cat = SqlCatalog("t", uri=f"sqlite:///{tmp}/c.db", warehouse=f"file://{tmp}")
+            cat.create_namespace_if_not_exists("ns")
+            cat.create_table("ns.t", schema=Schema(NestedField(1, "id", LongType(), required=False)),
+                             properties={"format-version": "3"})
+            cat.engine.dispose()
         record("PyIceberg writes a v3 table", PASS, "unexpectedly succeeded")
-        shutil.rmtree(tmp, ignore_errors=True)
     except NotImplementedError as e:
         record("PyIceberg writes a v3 table", GAP, str(e).splitlines()[0][:92])
     except Exception as e:
-        record("PyIceberg writes a v3 table", GAP,
+        record("PyIceberg writes a v3 table", FAIL,
                f"{type(e).__name__}: {str(e).splitlines()[0][:70]}")
 
-    # ---- features no available writer can produce ----
-    print("\nUNTESTED (Spark could not write these, so DuckDB is not graded on them)")
+    print("\nUNTESTED (outside this harness's writer route or setup)")
     for feat, info in truth["unwritable"].items():
         if info["writable"]:
             record(f"{feat} (now writable!)", GAP,
@@ -336,10 +349,10 @@ def main():
         con.execute(f"SELECT count(*), sum(id) FROM {scan(table)}").fetchall()
         return (time.perf_counter() - t0) * 1000
 
-    # Warm both sources, then alternate order so every sample does not inherit
-    # the same v3-first/v2-second cache state.
+    # These queries were already read during correctness checks. Warm the exact
+    # timed query once more, then alternate order. This is a warm-cache benchmark.
     for table in ("p.big3", "p.big2"):
-        con.execute(f"SELECT count(*) FROM {scan(table)}").fetchall()
+        timed_scan(table)
     timings = {"v3_ms": [], "v2_ms": [], "order": []}
     for i in range(7):
         order = ("p.big3", "p.big2") if i % 2 == 0 else ("p.big2", "p.big3")
@@ -350,8 +363,14 @@ def main():
     truth["performance"] = {
         "rows": nrows,
         "duckdb": duckdb.__version__,
+        "iceberg_extension": {"version": extension[0], "source": extension[1]},
+        "python": platform.python_version(),
         "platform": platform.platform(),
         "machine": platform.machine(),
+        "cpu": cpu_name(),
+        "threads": con.execute("SELECT current_setting('threads')").fetchone()[0],
+        "measured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "cache_state": "warm; correctness queries precede one extra warmup of the timed query",
         "warmups_per_table": 1,
         "timings_ms": timings,
     }
@@ -359,11 +378,9 @@ def main():
         json.dump(truth, fh, indent=2)
     lay = truth["layout"]
     print(f"  v3 deletion vectors (Puffin)   median {v3ms:7.1f} ms   "
-          f"{lay['v3']['delete_artifacts']} delete artifacts, "
-          f"{lay['v3']['delete_bytes']/1024:.1f} KiB")
+          f"{lay['v3']['live_delete_files']} live entries in {lay['v3']['live_physical_delete_files']} file(s)")
     print(f"  v2 positional deletes          median {v2ms:7.1f} ms   "
-          f"{lay['v2']['delete_artifacts']} delete artifacts, "
-          f"{lay['v2']['delete_bytes']/1024:.1f} KiB")
+          f"{lay['v2']['live_delete_files']} live entries in {lay['v2']['live_physical_delete_files']} file(s)")
     print(f"  -> v3 is {v2ms/v3ms:.1f}x faster on this machine")
     print(f"  raw timings written to {TRUTH_PATH}")
 
@@ -373,8 +390,53 @@ def main():
     n_skip = sum(1 for _, s, _ in results if s == SKIP)
     n_gap = sum(1 for _, s, _ in results if s == GAP)
     print(f"\n{n_pass} passed, {n_fail} failed, {n_gap} known gaps, {n_skip} untested")
-    # Known gaps and untested features are expected; only real mismatches fail.
+    truth["results"] = [{"label": label, "status": status.strip(), "detail": detail}
+                        for label, status, detail in results]
+    if args.results:
+        publish_results(truth, args.results)
+    con.close()
+    # Observed gaps and untested features are informational; failures are not.
     return 1 if n_fail else 0
+
+
+def cpu_name():
+    if sys.platform == "darwin":
+        try:
+            return subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                text=True, stderr=subprocess.DEVNULL).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return "unavailable (CPU query denied or failed)"
+    return platform.processor() or platform.machine()
+
+
+def publish_results(truth, path):
+    """Keep raw evidence, redact local paths, and fingerprint the measured code."""
+    import pathlib
+    import importlib.metadata
+    code = [pathlib.Path(ROOT, "run_all.py")]
+    for directory in ("bench", "tests", "tools"):
+        code.extend(sorted(pathlib.Path(ROOT, directory).glob("*.py")))
+    truth["provenance"] = {
+        "code_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in code},
+        "packages": dict(sorted((d.metadata["Name"], d.version)
+                                for d in importlib.metadata.distributions())),
+        "java": subprocess.run(["java", "-version"], capture_output=True, text=True, check=True).stderr.strip(),
+    }
+    def redact(value):
+        if isinstance(value, str):
+            for source in (os.path.realpath(ROOT), ROOT):
+                value = value.replace(source, "<repo>")
+            return value
+        if isinstance(value, list):
+            return [redact(v) for v in value]
+        if isinstance(value, dict):
+            return {k: redact(v) for k, v in value.items()}
+        return value
+    target = pathlib.Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(redact(truth), indent=2) + "\n", encoding="utf-8")
+    print(f"  shareable results written to {target}")
 
 
 if __name__ == "__main__":

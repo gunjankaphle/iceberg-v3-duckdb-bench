@@ -1,336 +1,204 @@
 # Iceberg v3 × DuckDB compatibility bench
 
-A reproducible bench that writes Apache Iceberg **v3** tables with Spark, reads them
-back with **DuckDB**, and checks whether DuckDB gets the same answers Spark does.
+A local experiment that writes Apache Iceberg tables with Spark and checks
+DuckDB's answers against Spark's answers. It covers **deletion vectors, row
+lineage, and variant values**, plus partitioning, merge-on-read updates, and
+time travel. It is not a certification of the entire v3 specification.
 
-It's the code behind the article *"Testing Iceberg v3 Against DuckDB: Deletion
-Vectors, Row Lineage, and Variant."*
+The publication run passed **24 checks**, with zero failures, six observed
+gaps, and eight untested cases. On its 5M-row warm scan, v3 took **40.5 ms**
+versus **148.4 ms** for v2: **3.7×** faster on that machine. See the saved
+evidence and measurement limits below.
 
-> **Scope.** This harness does **not** cover all of Iceberg v3. It exercises three
-> of the spec's capabilities end-to-end — deletion vectors, row lineage, and the
-> variant type — and explicitly reports the rest as untested, with the reason, on
-> every run. See [Coverage](#coverage) for the full list.
+## Run it
 
-## Result
-
-With **DuckDB 1.5.5**, **Iceberg 1.11.0**, **Spark 4.0.4** (abridged — the
-UNTESTED and READ PERFORMANCE sections are omitted here):
-
-```
-READ CORRECTNESS (DuckDB result vs Spark result on identical SQL)
-  ✓ v3 deletion vectors (Puffin)                 PASS
-  ✓ v3 DV row-identity checksum                  PASS
-  ✓ v2 positional deletes (baseline)             PASS
-  ✓ v3 row lineage (data)                        PASS
-  ✓ v3 partitioned table, multiple DVs           PASS
-  ✓ v3 MERGE (merge-on-read)                     PASS
-  ✓ v3 deletion vectors (large table)            PASS
-  ✓ v2 positional deletes (large table)          PASS
-  ✓ v3 row lineage (_row_id + _last_updated_seq) PASS
-  ✓ v3 variant type (deep/awkward values)        PASS
-  ✓ v3 variant exposed as native type            PASS  typeof() = VARIANT
-  ✓ v3 time travel across DV snapshots           PASS  5/5 (count+sum_id+sum_amount+sample)
-
-V3 ARTIFACT VALIDATION (what the writer actually produced)
-  ✓ v3 table is really format-version 3          PASS  format-version=3
-  ✓ v3 deletes are deletion-vector-v1 blobs      PASS  2 live DV blob(s) in 1 Puffin file
-  ✓ v3 manifest records DVs as Puffin            PASS  formats=['PUFFIN'], all reference a data file
-  ✓ v2 baseline is really format-version 2       PASS  format-version=2
-  ✓ v2 deletes are positional delete files       PASS  6 parquet, 0 DV blobs, manifest=['PARQUET']
-  ✓ neither format accumulates delete files      PASS  live delete artifacts: v3=2 v2=2
-  ✓ v3 packs a commit's deletes into fewer files PASS  physical files per commit: v3=1.0 v2=2.0
-
-LOCAL WRITE PATH: COPY TO (DuckDB)
-  ! COPY TO honours FORMAT_VERSION 3             GAP   asked v3, got format-version=2
-  ! COPY TO rejects unknown options              GAP   6/6 bogus options accepted silently
-  ! COPY TO ... APPEND true appends              GAP   5 rows + 1 -> 1 row (REPLACED)
-  ! COPY TO ... PARTITION_BY partitions          GAP   partition-spec fields = [] (ignored)
-  ! ATTACH supports a local (hadoop) catalog     GAP   accepted: glue, s3_tables
-
-PYICEBERG 0.12 (third engine, cross-check)
-  ✓ PyIceberg 0.12.0 reads a v3 table            PASS  format-version=3, 900 rows
-  ! PyIceberg writes a v3 table                  GAP   Writing V3 is not yet supported
-```
-
-**For the three v3 features it covers, DuckDB matches Spark exactly** — deletion
-vectors, row lineage, and the variant type, plus time travel across DV snapshots.
-On 5M rows with ~19% deleted, v3 deletion vectors read **3.5–4.7× faster** than
-the equivalent v2 positional deletes on one laptop. Each run takes 7 timed rounds
-with **alternating measurement order** and writes every raw timing to
-`truth.json`; order shows no detectable effect. Within a run the ratio is stable
-to ~±0.1×; the spread across runs is the v2 number drifting (135–195 ms) while v3
-stays near 40 ms.
-
-This is a statement about the features listed under [Coverage](#coverage), not
-about Iceberg v3 as a whole.
-
-On the **write** side DuckDB has two very different modes:
-
-- **With a catalog** (`ATTACH ... TYPE ICEBERG` against REST/Glue/S3 Tables):
-  `INSERT`/`UPDATE`/`DELETE` all work, and writing to a v3 table produces **real
-  Puffin deletion vectors** that Spark reads back correctly. Verified round-trip
-  against a local `apache/iceberg-rest-fixture`.
-- **Without a catalog** (`COPY TO` a local directory): create-only, v2 only, and
-  **unknown option names are accepted without error** — a made-up `BANANA true`
-  is accepted just as happily as `FORMAT_VERSION 3`. Of the options tested,
-  none were honoured: `APPEND true` does not append, it *replaces* the table,
-  and `PARTITION_BY` is ignored. There is no local/`hadoop` catalog for `ATTACH`.
-
-Practical rule: **if you want DuckDB to write Iceberg, give it a catalog.**
-
-**Automated vs manual.** Everything in the output above is automated, including
-all five local write-path findings (four `COPY TO`, one `ATTACH`) and the
-PyIceberg cross-check. Two things are **not** automated:
-
-1. The **catalog** write findings (`ATTACH` → `INSERT`/`UPDATE`/`DELETE` producing
-   real deletion vectors) — these need a running REST catalog, which this suite
-   deliberately doesn't require. See
-   [Manual findings](#manual-findings-not-covered-by-the-suite).
-2. The **across-run range** (3.5–4.7×) — each run reports its own ratio and raw
-   timings, but aggregating across runs was done by hand.
-
-## Coverage
-
-Iceberg v3 adds roughly nine capabilities. This harness exercises three of them
-end-to-end and reports the rest, with the blocking reason, on every run.
-
-| v3 capability | Status | Notes |
-|---|---|---|
-| Binary deletion vectors | ✅ **Tested** | Written by Spark, read by DuckDB, artifacts asserted as Puffin |
-| Row lineage | ✅ **Tested** | `_row_id` + `_last_updated_sequence_number` compared against Spark |
-| `variant` type | ✅ **Tested** | Deep nesting, 20-digit ints, unicode, empty containers, NULL |
-| Default values | ⚠️ Untested | Spark can't write them (`setting default values ... unsupported`) |
-| `geometry` / `geography` | ⚠️ Untested | Spark SQL parser: `[UNSUPPORTED_DATATYPE]` |
-| `unknown` type | ⚠️ Untested | Spark SQL parser: `[UNSUPPORTED_DATATYPE]` |
-| `timestamp_ns` / `timestamptz_ns` | ⚠️ Untested | Spark maps these to `timestamp` / `timestamptz` (microseconds) |
-| Multi-argument transforms | ⚠️ Untested | Iceberg-Spark: `Cannot convert transform with more than one column reference` |
-| Table encryption keys | ⚠️ **Not attempted** | Needs a KMS/key-manager; the harness never tries this one |
-
-**These blockers are specific to the writer this harness uses** — Spark 4.0.4 with
-`iceberg-spark-runtime-4.0_2.13:1.11.0`. They are not claims about Iceberg v3
-support in general: Trino, Flink, or a newer Iceberg release may write some of
-these fine. Encryption keys are the one row that was never attempted at all
-(it needs a KMS), as opposed to attempted and refused.
-
-Everything else in the ⚠️ column is **probed on every run**, not hardcoded — if a
-future Spark or Iceberg release gains support, the row flips to
-`GAP  writer gained support` instead of silently repeating stale news.
-Hand-forging metadata to fake these would prove nothing about real pipelines, so
-they're reported rather than graded.
-
-If your interest in v3 is geospatial types or default values, **check your writer
-before blaming your reader.**
-
-## Running it
-
-Requires a JDK (Spark needs one) and Python 3.9+.
+Requires **Python 3.10+ and JDK 17 or 21**. Python 3.11 and JDK 21 are used in CI.
+The pinned engines are DuckDB 1.5.6, Spark 4.0.4, Iceberg 1.11.0, and
+PyIceberg 0.12.0.
 
 ```bash
-brew install openjdk@21          # or any JDK 17/21; set JAVA_HOME if not Homebrew
-python3 -m venv .venv && . .venv/bin/activate
+git clone https://github.com/gunjankaphle/iceberg-v3-duckdb-bench
+cd iceberg-v3-duckdb-bench
+# macOS; on other platforms install a JDK through your package manager
+brew install openjdk@21
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
 
-python run_all.py                # full run, 5M-row perf tables (~5-10 min)
-python run_all.py --rows 200000  # much faster, smaller perf gap
-python run_all.py --verify-only  # re-run DuckDB checks against existing tables
+python run_all.py --rows 200000       # quicker check
+python run_all.py                     # 5M-row performance tables
+python run_all.py --verify-only       # existing tables + truth.json required
 ```
 
-(Use `python3` to create the venv; inside the activated venv, `python` works.)
+The Spark setup honors `JAVA_HOME`, or finds Homebrew's OpenJDK 21 installation.
+On other installations, set `JAVA_HOME` to your JDK directory. The first run
+needs network access to download the Iceberg JAR and DuckDB extension.
 
-Spark downloads the Iceberg runtime JAR from Maven on first run.
+**The warehouse is disposable.** A build purges and recreates this harness's
+tables under `warehouse/` and replaces `truth.json`. Do not put personal data
+there. Local DuckDB write probes use their own temporary directory and remove
+only that directory. Full subprocess logs are saved under `logs/`, and a failed
+subprocess prints its last 40 lines.
 
-Exit code is non-zero only if DuckDB **disagrees with Spark**. Known gaps and
-untestable features are reported but don't fail the run.
+`--rows` must be at least 1,000. The default 5M-row build can take several
+minutes. Exit status is nonzero for failed comparisons, invalid artifacts,
+unexpected probe errors, build failures, or failed regression/doc checks.
+Observed limitations are reported as `GAP`; uncovered features as `n/a`.
+Neither is a successful compatibility test.
 
-## How the comparison works
+## What is checked
 
-The thing that makes this trustworthy is that expected values are never
-hardcoded. Each check in `bench/checks.py` defines one SQL string, which is run
-**twice**:
+| Area | Evidence |
+|---|---|
+| v3 deletion vectors | Spark-produced data, updates and deletes; all 900 surviving rows compared |
+| v2 positional deletes | Same small workload and full-row comparison |
+| Row lineage | All data rows and `_row_id` / `_last_updated_sequence_number` compared |
+| Partitioned v3 table | All surviving rows compared after overlapping deletes and an update |
+| MERGE | All 100 resulting rows compared, including updated payloads |
+| Time travel | Every row compared in each of five partitioned-table snapshots, plus aggregates |
+| Variant | JSON values compared with exact decimal parsing and boolean/number distinction; native `VARIANT` exposure checked separately |
+| Large tables | `count(*)` and `sum(id)` compared; **not** a full-row comparison |
+| Artifacts | Metadata format version, delete manifests, and Puffin footer blob types checked for the large-table pair |
+| Delete history | Three delete rounds must replace entries rather than accumulate them |
+| Local writes | Format version, unknown options, append, partitioning, and attempted Hadoop catalog attachment |
+| PyIceberg | Reads the v3 delete fixture and matches its row count; attempts v3 table creation |
 
-- `bench/build.py` runs it through **Spark** and writes the answer to `truth.json`
-- `bench/verify.py` runs the same SQL through **DuckDB** and compares
+Shared SQL in `bench/checks.py` runs through Spark to generate the baseline and
+through DuckDB to compare. Variant serialization is engine-specific, but the
+parsed values are compared by the same code. Spark is the reference for this
+experiment, not an independent proof of specification compliance.
 
-So `PASS` means two independent engines agreed on the same query over the same
-table — not that a result matched a constant someone pasted in. `truth.json` is
-gitignored and regenerated per run, and snapshot IDs for the time-travel test are
-resolved at build time (they're generated fresh on every commit, so hardcoding
-them would break for everyone but the original author).
+Integers are exact. Ordinary SQL floating-point results are rounded to four
+decimal places before comparison. The fixtures use binary-exact amounts such
+as `id * 1.5`; that does not make the tolerance disappear. Variant decimal values
+are compared exactly, without that rounding. The JSON comparison checks the
+tested values, not every possible variant subtype or physical encoding.
 
-Features Spark cannot produce in this harness are **probed at build time**, not
-assumed. If a future Spark or Iceberg release gains support, the run flips that
-row to `GAP  writer gained support` instead of quietly reporting stale news.
-(Table encryption keys are the one exception: never attempted, so reported as
-untried rather than probed.)
+The artifact check follows each live manifest entry's `content_offset` into its
+Puffin footer and requires `deletion-vector-v1`. A filename alone is not evidence
+of a DV. Manifest delete entries and physical files are counted separately:
+two DVs may occupy one Puffin file. Historical files retained for earlier
+snapshots are not described as orphans.
 
-## What's tested
+## Results and reproducibility
 
-| Area | Table | What it proves |
-|---|---|---|
-| Deletion vectors | `f.dv` | v3 merge-on-read delete writes a Puffin DV; DuckDB applies it |
-| Row identity | `f.dv` | `count/sum/min/max(id)` — catches a DV applied at the wrong offset |
-| v2 baseline | `f.dv_v2` | Identical workload as positional deletes, for comparison |
-| Row lineage | `f.lineage` | `_row_id` survives an update; `_last_updated_sequence_number` bumps |
-| Partitioning | `h.part` | Multiple DVs across partitions, overlapping delete predicates |
-| Variant | `h.var2` | 20-digit ints, negative decimals, unicode, 4-deep nesting, empty containers, NULL |
-| Time travel | `h.part` | Older snapshots apply the DVs as of *that* commit — compared on count, `sum(id)`, `sum(amount)` and an ordered sample, so returning the right *number* of wrong rows fails |
-| MERGE | `h.merge` | v3 merge-on-read MERGE |
-| Artifact validation | `p.big2/3` | The v3 table really is format-version 3, and its delete artifacts are verified as deletion vectors two independent ways: the **Puffin footer is parsed** and every blob must be `deletion-vector-v1`, and the **manifest** (`.delete_files`) must record them as `PUFFIN` with a `referenced_data_file`. Converse for the v2 baseline. A `.puffin` filename is never treated as proof |
-| Local write path | `_dw_*` | All five local write gaps (four `COPY TO`, one `ATTACH`), asserted rather than described |
-| Third engine | `f.dv` | PyIceberg 0.12 reads the v3 table and matches Spark's row count; its v3 *writer* raises `NotImplementedError` |
-| Performance | `p.big2/3` | Same workload, v2 vs v3, median of 7 runs |
+The current DuckDB 1.5.6 verification run is saved in
+[results/publication-duckdb-1.5.6.json](results/publication-duckdb-1.5.6.json).
+It uses Iceberg extension build `890b78a9c` and reuses the existing Spark-built
+fixtures; Spark writer probes and layout evidence were not regenerated.
+The earlier 1.5.5 run remains in [results/publication.json](results/publication.json).
+Supplementary 1.5.6 lineage, append, and before/after-delete checks are saved in
+[results/article-probes-duckdb-1.5.6.json](results/article-probes-duckdb-1.5.6.json).
+It includes Spark baselines, layout evidence, check verdicts, seven raw timing
+pairs, engine and extension versions, CPU, Java, Python, thread count, UTC
+measurement time, and SHA-256 fingerprints of the benchmark source files.
+Local repository paths are replaced with `<repo>`; the export is evidence, not
+a portable replacement for the local warehouse or `truth.json`.
 
-Artifact validation matters because the read checks alone would still pass if the
-writer silently fell back to v2 positional deletes — the query results would be
-identical. The suite asserts the on-disk representation separately.
-
-### Float comparison
-
-Integers and integral Decimals are compared **exactly** — the row-identity
-checksums depend on that, and the 20-digit variant integer must not become a
-float. Non-integral values are compared to `FLOAT_DECIMALS = 4` places
-(`bench/checks.py`), because the two engines render doubles differently and
-summing 5M of them can differ in the last bits by aggregation order. The test
-data uses values that are exact in binary floating point (`id * 1.5`, `id * 1.0`),
-so in practice both engines return identical doubles and the tolerance is never
-exercised — but it is a real loosening and is documented as such.
-
-## Manual findings (not covered by the suite)
-
-These were verified by hand and are **not** asserted by `run_all.py`, because they
-need a running REST catalog:
-
-With a catalog attached, DuckDB does full `INSERT`/`UPDATE`/`DELETE`, and writing
-into a **Spark-created v3 table** produces **real Puffin deletion vectors** that
-Spark reads back correctly.
-
-**1. Start the catalog.** The bind-mount matters: without it the catalog writes
-metadata inside the container at a path DuckDB then can't resolve on the host.
+Save another run without losing earlier evidence:
 
 ```bash
-mkdir -p /tmp/ice-wh && chmod 777 /tmp/ice-wh
-docker run -d --name ice-rest -p 8181:8181 \
-  -v /tmp/ice-wh:/tmp/ice-wh \
-  -e CATALOG_WAREHOUSE=/tmp/ice-wh \
-  -e CATALOG_IO__IMPL=org.apache.iceberg.hadoop.HadoopFileIO \
-  apache/iceberg-rest-fixture@sha256:db8de90b5b7693d4ac334c336f91d9bbe320d7b19f4f514d26de84cdfbcbfe8d
-# that digest is what was tested; apache/iceberg-rest-fixture:1.10.1 is the
-# newest version tag if you prefer one.
+python run_all.py --results results/my-run.json
+python run_all.py --verify-only --results results/my-reread.json
 ```
 
-**2. Create the v3 table with Spark**, pointed at the same catalog:
+These commands overwrite the named export if it exists; choose distinct names
+when collecting multiple runs. An existing `truth.json` from an older schema
+requires a rebuild.
 
-```python
-from pyspark.sql import SparkSession
+The Iceberg extension is installed from DuckDB's core repository and its build
+is recorded. Pinning the DuckDB Python package alone does not pin every possible
+extension update. Compare the recorded extension build when reproducing a result.
+Top-level Python dependencies are pinned; transitive dependencies are reported
+by the installed environment rather than locked here.
 
-spark = (
-    SparkSession.builder
-    .config("spark.jars.packages",
-            "org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.11.0")
-    .config("spark.sql.extensions",
-            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-    .config("spark.sql.catalog.rest", "org.apache.iceberg.spark.SparkCatalog")
-    .config("spark.sql.catalog.rest.type", "rest")
-    .config("spark.sql.catalog.rest.uri", "http://localhost:8181")
-    .config("spark.sql.catalog.rest.warehouse", "/tmp/ice-wh")
-    .master("local[2]")
-    .getOrCreate()
-)
-```
+The performance query is `SELECT count(*), sum(id)`. Correctness checks read both
+tables first, then the exact timed query gets one extra warmup per table. Seven
+rounds alternate v3-first and v2-first order, on one DuckDB connection. These are
+**warm local scans**, including query planning and metadata resolution, not
+cold-start or object-storage measurements. The ratio is the median v2 time divided
+by the median v3 time. Performance never determines the suite's exit status.
 
-```sql
-CREATE NAMESPACE IF NOT EXISTS rest.v3ns;
-CREATE TABLE rest.v3ns.t3 (id BIGINT, name STRING) USING iceberg
-  TBLPROPERTIES ('format-version'='3',
-                 'write.delete.mode'='merge-on-read',
-                 'write.update.mode'='merge-on-read');
-INSERT INTO rest.v3ns.t3 SELECT id, concat('v',id) FROM range(1,11);
-DELETE FROM rest.v3ns.t3 WHERE id = 5;          -- 9 rows remain
-```
+The observed advantage cannot be assigned solely to the bitmap encoding: this
+writer also packs two live DVs into one Puffin file, versus two live Parquet
+position-delete files. Reader implementation, file packaging, and cache state
+can contribute. Equal delete-entry counts do not imply equal file-open costs.
 
-**3. Write to it from DuckDB:**
+## Observed local write limitations
 
-```sql
-INSTALL iceberg; LOAD iceberg;
-ATTACH '' AS ice (TYPE ICEBERG, ENDPOINT 'http://localhost:8181',
-                  AUTHORIZATION_TYPE 'none');
-INSERT INTO ice.v3ns.t3 VALUES (99, 'from-duckdb');
-DELETE FROM ice.v3ns.t3 WHERE id = 2;
-UPDATE ice.v3ns.t3 SET name = 'changed' WHERE id = 3;
-```
+On the tested extension, the automated probes found:
 
-**4. Check the artifacts.** The table stays at `format-version: 3` with **3 Puffin
-files and 0 Parquet delete files**, two of the Puffin files written by DuckDB —
-its files use bare UUIDv7 names (`966d0efc-…-deletes.puffin`) where Spark's are
-task-numbered (`00000-211-…-deletes.puffin`).
+- `FORMAT_VERSION 3` was accepted but produced a v2 table.
+- All six option probes were accepted without an error, including
+  `BANANA true` and `FORMAT_VERSION 99`.
+- `APPEND true` replaced a five-row table with the single new row.
+- `PARTITION_BY p` produced an empty partition specification.
+- `ENDPOINT_TYPE 'HADOOP'` was rejected.
 
-**5. Read back from Spark — in a NEW process.** This step has a trap worth knowing
-about: Iceberg's Spark catalog caches table metadata, so the session from step 2
-will happily keep serving the pre-DuckDB state and make it look like nothing was
-written. Start a fresh Spark process (or set
-`spark.sql.catalog.rest.cache-enabled=false`), then:
+These describe the tested calls, not every option or catalog DuckDB supports.
+Replacement means the current table lost its previous rows; the suite does not
+establish whether the underlying old files can be recovered. Treat local
+`COPY TO` as an export path and verify the resulting metadata before relying
+on an option.
 
-```sql
-SELECT id, name FROM rest.v3ns.t3 ORDER BY id;
-```
+Catalog writes are **outside the automated suite**. An earlier manual experiment
+against `apache/iceberg-rest-fixture` observed DuckDB `INSERT`, `DELETE`, and
+`UPDATE` into a Spark-created v3 table, with the resulting rows visible to Spark.
+That experiment's evidence is not included in the publication export and was
+not repeated for the final review. It does not establish behavior for Glue or
+S3 Tables, nor does filename inspection alone prove the written blobs were DVs.
+For catalog use, consult [DuckDB's Iceberg documentation](https://duckdb.org/docs/stable/core_extensions/iceberg/overview).
 
-Expected — 9 rows, with DuckDB's insert, delete and update all round-tripped
-through deletion vectors:
+## Coverage limits
 
-```
-(1,'v1') (3,'changed') (4,'v4') (6,'v6') (7,'v7') (8,'v8') (9,'v9') (10,'v10') (99,'from-duckdb')
-        ^ updated by DuckDB                                            ^ inserted by DuckDB
-id=2 absent (deleted by DuckDB)   id=5 absent (deleted by Spark in step 2)
-```
+The [v3 specification](https://iceberg.apache.org/spec/#version-3-extended-types-and-capabilities)
+extends types and metadata beyond these fixtures.
+
+| Capability outside the read tests | This harness's writer route |
+|---|---|
+| Column defaults | Spark SQL `ADD COLUMN ... DEFAULT` rejected |
+| Geometry / geography | Spark SQL type declarations rejected |
+| Unknown | Spark SQL type declaration rejected |
+| Multi-argument transforms | The attempted `bucket(4, a, b)` declaration rejected; this is one attempted syntax, not proof about every API or transform |
+| Nanosecond timestamps | Ordinary `TIMESTAMP_NTZ` / `TIMESTAMP` declarations produce microsecond Iceberg types; an explicit nanosecond schema is not tested |
+| Encryption keys | Not attempted; no key-manager setup |
+
+The rejected declarations and ordinary timestamp mappings are re-probed on each
+build. Success on a previously blocked route is flagged for adding a reader
+test. These observations concern this SQL route and pinned writer, not all
+Spark/Iceberg APIs or other engines.
+
+Other useful cases remain outside scope: v2-to-v3 migration with retained position
+deletes, equality deletes, schema/partition evolution, concurrent writers,
+object storage, and a broad distribution of delete patterns. Three supported
+features do not imply complete v3 support.
+
+## Development
 
 ```bash
-docker rm -f ice-rest && rm -rf /tmp/ice-wh   # cleanup
+python -m unittest discover -s tests
+python tools/check_docs.py
 ```
 
-These steps were run end-to-end against the pinned digest above; the output shown
-is from that run.
-
-## Why Spark and not PyIceberg
-
-PyIceberg 0.12.0 can *read* v3 but cannot *write* it:
+GitHub Actions runs those checks and a 200k-row end-to-end build, retaining its
+results and logs as an artifact. The documentation check parses Python and shell
+code fences; it does not execute snippets or validate SQL.
 
 ```
-NotImplementedError: Writing V3 is not yet supported
-# https://github.com/apache/iceberg-python/issues/1551
+run_all.py            doc/regression checks, build, verify, full logs
+bench/checks.py       shared SQL and comparison helpers
+bench/build.py        Spark fixtures, writer probes, truth.json
+bench/verify.py       DuckDB comparisons, timings, sanitized export
+bench/spark_setup.py  Spark session and metadata discovery
+tests/test_checks.py  comparison regression tests
+tools/check_docs.py   Python/shell fence syntax checks
+results/             publication evidence
 ```
 
-Its v3 types (`UnknownType`, `GeometryType`, `TimestampNanoType`, `FileFormat.PUFFIN`)
-are all defined, and its reader handles v3 fine — only the writer is missing. So
-Spark + `iceberg-spark-runtime-4.0_2.13:1.11.0` is the writer here.
-
-## Layout
-
-```
-run_all.py            build + verify
-bench/checks.py       shared check definitions (the SQL both engines run)
-bench/build.py        Spark: build tables, probe writer limits, emit truth.json
-bench/verify.py       DuckDB: run the same SQL, compare, print the report card
-bench/spark_setup.py  Spark session + metadata path resolution
-tools/check_docs.py   parses ```python / bash fences in the docs (run by run_all.py)
-```
-
-## Caveats
-
-The ~4× speedup was measured on a laptop, on local disk, on a scan-heavy query,
-with one delete pattern. Don't quote it as a universal number.
-
-Note what it is *not* caused by: in this workload **neither format accumulates**
-delete artifacts. Spark rewrites them on every delete round for v2 and v3 alike
-(`added 2, removed 2, total 2` each round), so both readers end up opening two
-delete artifacts covering identical deletes. The suite asserts this. The likely
-cause is the **encoding** — a roaring bitmap tested directly versus a Parquet
-position list that must be read and anti-joined — but that is a mechanism, not a
-measured result. The magnitude shrinks on small tables: at 200k rows the same
-bench shows ~2×.
-
-The reversed-measurement-order check is automated (7 rounds, alternating, raw
-timings in `truth.json`). Only the across-run range was aggregated by hand.
+The Medium draft is `ARTICLE.md`, intentionally ignored by Git so the post can
+be published separately. No publishing or account credentials are needed to run
+this repository.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

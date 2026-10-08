@@ -7,7 +7,7 @@ same SQL on both engines is what makes "matches Spark" a real comparison rather
 than an assertion against a pasted-in constant.
 """
 import json
-import re
+from decimal import Decimal
 
 # (key, table, label, sql)
 CHECKS = [
@@ -27,6 +27,18 @@ CHECKS = [
      "SELECT count(*), sum(id) FROM {t}"),
     ("big2", "p.big2", "v2 positional deletes (large table)",
      "SELECT count(*), sum(id) FROM {t}"),
+]
+
+# These fixtures are small enough to compare every row, including payloads.
+CHECKS += [
+    ("dv_rows", "f.dv", "v3 deletes: all surviving rows",
+     "SELECT id, name, amount FROM {t} ORDER BY id"),
+    ("dv_v2_rows", "f.dv_v2", "v2 deletes: all surviving rows",
+     "SELECT id, name, amount FROM {t} ORDER BY id"),
+    ("part_rows", "h.part", "partitioned v3: all surviving rows",
+     "SELECT id, cat, amount FROM {t} ORDER BY id"),
+    ("merge_rows", "h.merge", "v3 MERGE: all resulting rows",
+     "SELECT id, v FROM {t} ORDER BY id"),
 ]
 
 # Row-lineage metadata columns. Spark exposes them directly; DuckDB exposes the
@@ -52,9 +64,40 @@ def normalize_json(s):
     if isinstance(s, (dict, list)):
         return s
     s = s.strip()
-    if s == "" or s == "null":
+    if s == "null":
         return None
-    return json.loads(_restore_leading_zeros(s))
+    return json.loads(_restore_leading_zeros(s), parse_float=Decimal)
+
+
+def json_equal(left, right):
+    """Compare JSON values exactly, keeping booleans distinct from numbers."""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            json_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            json_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, (int, Decimal)) and isinstance(right, (int, Decimal)):
+        return left == right
+    return type(left) is type(right) and left == right
+
+
+def stable_delete_history(layout):
+    """Require three rounds that replace, rather than accumulate, entries."""
+    history = layout.get("snapshot_history")
+    if not isinstance(history, list):
+        return False
+    rounds = [h for h in history if h["added_delete_files"]]
+    if len(rounds) != 3:
+        return False
+    total = rounds[0]["total_delete_files"]
+    return total > 0 and all(
+        h["total_delete_files"] == total
+        and h["added_delete_files"] == total
+        and h["removed_delete_files"] == (0 if i == 0 else total)
+        for i, h in enumerate(rounds))
 
 
 def _restore_leading_zeros(s):
@@ -107,7 +150,7 @@ def _restore_leading_zeros(s):
 # would pass. It is bounded deliberately -- the test data uses values that are
 # exact in binary floating point (id * 1.5, id * 1.0), so in practice both
 # engines return identical doubles and this tolerance is never exercised.
-# Integers and Decimals are compared EXACTLY, with no rounding, which is what
+# Integers and integral Decimals are compared EXACTLY, which is what
 # the row-identity checksums (sum/min/max of id) rely on.
 FLOAT_DECIMALS = 4
 
@@ -119,8 +162,6 @@ def normalize_row(row):
     integers must not become floats); non-integral values are compared to
     FLOAT_DECIMALS places. See that constant for why.
     """
-    from decimal import Decimal
-
     out = []
     for v in row:
         if isinstance(v, Decimal):
